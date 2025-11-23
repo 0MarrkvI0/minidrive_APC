@@ -6,17 +6,102 @@
 
 using asio::ip::tcp;
 
-int main(int argc, char* argv[]) {
+
+bool send_request(asio::ip::tcp::socket& socket, const Request& req)
+{
     try {
-        if (argc != 3) {
-            std::cerr << "Usage: client <host> <port>\n";
+        nlohmann::json j = req;
+        std::string serialized = j.dump();
+
+        serialized += '\n';
+
+        asio::write(socket, asio::buffer(serialized));
+        return true;
+    } catch (std::exception& e) {
+        std::cerr << "[error] Failed to send request: " << e.what() << "\n";
+        return false;
+    }
+}
+
+Response receive_response(asio::ip::tcp::socket& socket)
+{
+    asio::streambuf buf;
+    asio::read_until(socket, buf, '\n');
+
+    std::istream is(&buf);
+    std::string line;
+    std::getline(is, line);
+
+    nlohmann::json j = nlohmann::json::parse(line);
+    Response resp = j.get<Response>();
+    return resp;
+}
+
+
+struct config {
+    std::string username;
+    std::string server_ip;
+    std::string port;
+    std::string log_file;
+};
+
+config set_up_config(int argc, char* argv[], config& cfg) {
+
+    std::string server_arg = argv[1];
+    size_t at_pos = server_arg.find('@');
+    size_t colon_pos = server_arg.find(':');
+
+    if (at_pos != std::string::npos) {
+        cfg.username = server_arg.substr(0, at_pos);
+        cfg.server_ip = server_arg.substr(at_pos + 1, colon_pos - at_pos - 1);
+    } else {
+        cfg.server_ip = server_arg.substr(0, colon_pos);
+    }
+
+    cfg.port = server_arg.substr(colon_pos + 1);
+
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--log" && i + 1 < argc) {
+            cfg.log_file = argv[++i];
+        }
+    }
+
+    if (!cfg.log_file.empty()) {
+    if (!std::filesystem::exists(cfg.log_file)) {
+        std::cerr << "[error] log file does not exist: " << cfg.log_file << "\n";
+        exit(1);
+     }
+    }
+
+
+    std::cout << "Username: " << (cfg.username.empty() ? "(none)" : cfg.username) << std::endl;
+    std::cout << "Server IP: " << cfg.server_ip << std::endl;
+    std::cout << "Port: " << cfg.port << std::endl;
+    std::cout << "Log file: " << (cfg.log_file.empty() ? "(none)" : cfg.log_file) << std::endl;
+
+    return cfg;
+}
+
+
+
+int main(int argc, char* argv[]) {
+
+       std::cout << argc << std::endl;
+        if (argc < 2 || argc > 4) 
+        {
+            std::cerr << "Usage: ./client [username@]<server_ip>:<port> [--log <log_file>]\n";
             return 1;
         }
+    
+    try {
 
         asio::io_context io_context;
+        config client_config;
+        client_config = set_up_config(argc, argv, client_config);
 
         tcp::resolver resolver(io_context);
-        auto endpoints = resolver.resolve(argv[1], argv[2]);
+        auto endpoints = resolver.resolve(client_config.server_ip, client_config.port);
 
         tcp::socket socket(io_context);
         // https://think-async.com/Asio/asio-1.36.0/doc/asio/reference/connect/overload8.html
@@ -24,27 +109,93 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Connected to server. Type messages (Ctrl+C to quit):\n";
 
-        while (true) {
-            std::string message;
-            std::cout << "> ";
-            std::getline(std::cin, message);
+        //TODO: handle public profile
+        bool logged_in = false;
+        Request req;
+        req.cmd = "AUTH";
+        req.args["username"] = client_config.username;
 
-            if (message.empty()) continue;
-
-            // append new line as delimiter
-            message += '\n';
-
-            // Send message
-            asio::write(socket, asio::buffer(message));
-
-            // Receive echo
-            char reply[1024];
-            size_t reply_length = socket.read_some(asio::buffer(reply));
-            std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
+        if (!send_request(socket, req)) {
+            std::cerr << "[error] Failed to send AUTH request\n";
+            return 1;
         }
+
+        while (!logged_in) 
+        {
+            Response resp = receive_response(socket);
+            std::cout << "[server] Response: " << resp.status
+                    << " (" << resp.code << "): " << resp.message << "\n";
+
+            //TODO: handle different error codes
+            if (resp.status == "ERROR") 
+            {
+                switch (resp.code)
+                {
+                case 1002:
+                    std::cerr << "[error] Username already taken. Please choose another username:\n";
+                    std::cin >> client_config.username;
+                    req.args["username"] = client_config.username;
+                    break;
+
+                case 1001:
+                    std::cerr << "[error] User not found. Please register first.\n";
+                    
+                
+                default:
+                    break;
+                }
+                
+                req.cmd = "REGISTER";
+                req.args["username"] = client_config.username;
+                std::string password;
+                std::cout << "Enter password for new user '" << client_config.username << "': ";
+                std::getline(std::cin, password);
+                req.args["password"] = password;
+                std::cout << "Registering new user...\n";
+                if (!send_request(socket, req)) 
+                {
+                    std::cerr << "[error] Failed to send REGISTER request\n";
+                    return 1;
+                }
+            }
+
+            if (resp.code == 0)  
+            {
+                req.cmd = "LOGIN";
+                req.args["username"] = client_config.username;
+                std::string password;
+                std::cout << "Enter password for new user '" << client_config.username << "': ";
+                std::getline(std::cin, password);
+                req.args["password"] = password;
+                std::cout << "Registering new user...\n";
+                if (!send_request(socket, req)) 
+                {
+                    std::cerr << "[error] Failed to send REGISTER request\n";
+                    return 1;
+                }
+            }
+        // while (true) {
+        //     std::string message;
+        //     std::cout << "> ";
+        //     std::getline(std::cin, message);
+
+        //     if (message.empty()) continue;
+
+
+        //     // append new line as delimiter
+        //     message += '\n';
+
+        //     // Send message
+        //     asio::write(socket, asio::buffer(message));
+
+        //     // Receive echo
+        //     char reply[1024];
+        //     size_t reply_length = socket.read_some(asio::buffer(reply));
+        //     std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
+        // }
     }
     catch (std::exception& e) {
-        std::cerr << "Exception: " << e.what() << "\n";
+        std::cerr << "[error] " << e.what() << "\n";
     }
 
     return 0;

@@ -3,60 +3,280 @@
 #include <asio.hpp>
 #include <iostream>
 #include <filesystem>
+#include <string>
+#include <fstream>
+#include <sodium.h>
 
-// Simple blocking MiniDrive server skeleton
 
-int main(int argc, char* argv[]) {
-    if (argc < 5) {
+std::optional<nlohmann::json> find_user(const nlohmann::json& db, const std::string& username) {
+    for (const auto& u : db["users"]) {
+        if (u["username"] == username) {
+            return u;
+        }
+    }
+    return std::nullopt;
+}
+
+void save_user_db(const nlohmann::json& user_db, const std::string& root_dir)
+{
+    std::ofstream out(root_dir + "/users.json");
+    out << user_db.dump(4);
+}
+
+
+    
+Request receive_request(asio::ip::tcp::socket& socket)
+{
+    asio::streambuf buf;
+    asio::read_until(socket, buf, '\n');
+
+    std::istream is(&buf);
+    std::string line;
+    std::getline(is, line);
+
+    nlohmann::json j = nlohmann::json::parse(line);
+    Request req = j.get<Request>();
+    return req;   
+}
+
+bool send_response(asio::ip::tcp::socket& socket, const Response& resp)
+{
+    try {
+        nlohmann::json j = resp;
+        std::string serialized = j.dump();
+
+        serialized += '\n';
+
+        asio::write(socket, asio::buffer(serialized));
+        return true;
+
+    } catch (std::exception& e) {
+        std::cerr << "[error] Failed to send response: " << e.what() << "\n";
+        return false;
+    }
+}
+
+
+
+struct config {
+    int port;
+    std::string root_dir;
+};
+
+struct user_profile {
+    std::string username;
+    std::string directory;
+};
+
+config set_up_config(int argc, char* argv[], config& cfg) {
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--port") cfg.port = std::stoi(argv[++i]);
+        else if (arg == "--root") cfg.root_dir = argv[++i];
+    }
+
+    if (!cfg.root_dir.empty()) {
+    if (!std::filesystem::exists(cfg.root_dir)) {
+        std::cerr << "[error] log file does not exist: " << cfg.root_dir << "\n";
+        exit(1);
+     }
+    }
+
+    std::cout << "Port: " << cfg.port << std::endl;
+    std::cout << "Root directory: " << cfg.root_dir << std::endl;
+
+    if (cfg.root_dir.empty()) {
+        std::cerr << "[error] Root directory not specified\n";
+        exit(1);
+    }
+
+    if (cfg.port <= 0 || cfg.port > 65535) {
+        std::cerr << "[error] Invalid port number: " << cfg.port << "\n";
+        exit(1);
+    }
+
+    return cfg;
+}
+
+int main(int argc, char* argv[]) 
+{
+
+    if (argc != 5) 
+    {
         std::cout << "Usage: ./server --port <PORT> --root <ROOT_DIR>\n";
         return 1;
     }
 
-    int port = 0;
-    std::string root;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--port") port = std::stoi(argv[++i]);
-        else if (arg == "--root") root = argv[++i];
-    }
-
-    if (!std::filesystem::exists(root)) {
-        std::cerr << "[error] root directory does not exist\n";
-        return 1;
-    }
-
     try {
+
+        config server_config;
+        server_config = set_up_config(argc, argv, server_config);
+
+        nlohmann::json user_db;
+
+        std::ifstream f(server_config.root_dir + "/users.json");
+        if (f.is_open()) 
+        {
+            f >> user_db;
+        } 
+        else 
+        {
+            user_db["users"] = nlohmann::json::array();
+        }
+
+        if (sodium_init() < 0) 
+        {
+            throw std::runtime_error("Failed to initialize libsodium");
+        }
+    
+        std::optional<nlohmann::json> user;
         asio::io_context io;
 
         asio::ip::tcp::acceptor acceptor(
             io,
-            asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)
+            asio::ip::tcp::endpoint(asio::ip::tcp::v4(), server_config.port)
         );
 
-        std::cout << "[server] Running on port " << port << "\n";
-        std::cout << "[server] Root directory: " << root << "\n";
+        std::cout << "[server] Running on port " << server_config.port << "\n";
+        std::cout << "[server] Root directory: " << server_config.root_dir<< "\n";
 
-        while (true) {
-            asio::ip::tcp::socket socket(io);
-            std::cout << "[server] Waiting for client...\n";
-
-            acceptor.accept(socket);
+        asio::ip::tcp::socket socket(io);
+        std::cout << "[server] Waiting for client...\n";
+         acceptor.accept(socket);
             std::cout << "[server] Client connected: "
                       << socket.remote_endpoint() << "\n";
+        while (true) 
+        {
+            Request req = receive_request(socket);
+            std::cout << "[server] Received request: " << req.cmd << "\n";
+            std::cout << "[server] Args: " << req.args.dump() << "\n";
 
-            // Receive message
-            asio::streambuf buffer;
-            asio::read_until(socket, buffer, '\n');
+            if (req.cmd == "AUTH") 
+            {
+                std::string username = req.args.value("username", "");
 
-            std::string msg((std::istreambuf_iterator<char>(&buffer)), {});
-            std::cout << "[server] Received: " << msg << "\n";
+                user = find_user(user_db, username);
 
-            // Respond
-            std::string response = "OK\n";
-            asio::write(socket, asio::buffer(response));
+                if (user != std::nullopt) {
+                    // need password verification
+                    Response resp{"OK", 0, "USER_EXISTS", {}};
+                    send_response(socket, resp);
+                } else {
+                    // register error response
+                    Response resp{"ERROR", 1001, "USER_NOT_FOUND", {}};
+                    send_response(socket, resp);
+                }
+            }
 
-            std::cout << "[server] Sent response\n";
+            if (req.cmd == "REGS") {
+
+                std::string username = req.args.value("username", "");
+                std::string password = req.args.value("password", "");
+
+                if (username.empty() || password.empty()) {
+                    send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
+                    continue;
+                }
+
+                user = find_user(user_db, username);
+                if (user != std::nullopt) {
+                    send_response(socket, {"ERROR", 1002, "USERNAME_TAKEN", {}});
+                    continue;
+                }
+
+                // Create sodium password hash (includes its own salt internally)
+                char hash_str[crypto_pwhash_STRBYTES];
+
+                if (crypto_pwhash_str(
+                        hash_str,
+                        password.c_str(),
+                        password.size(),
+                        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                        crypto_pwhash_MEMLIMIT_INTERACTIVE
+                    ) != 0)
+                {
+                    send_response(socket, {"ERROR", 500, "HASHING_FAILED", {}});
+                    continue;
+                }
+
+                // Store user in DB
+                nlohmann::json new_user = 
+                {
+                    {"username", username},
+                    {"password_hash", hash_str}   // store hash as string with salt
+                };
+
+                user_db["users"].push_back(new_user);
+
+                // Save DB
+                save_user_db(user_db, server_config.root_dir);
+
+                // Create user's private directory
+                std::string user_dir = server_config.root_dir + "/" + username;
+                std::filesystem::create_directory(user_dir);
+
+                // Respond to client
+                send_response(socket, {"OK", 0, "USER_REGISTERED", {}});
+
+                continue;
+            }
+
+            if (req.cmd == "LOGN") 
+            {
+                std::string username = req.args.value("username", "");
+                std::string password = req.args.value("password", "");
+
+                if (username.empty() || password.empty()) {
+                    send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
+                    continue;
+                }
+
+                user = find_user(user_db, username);
+                if (user == std::nullopt) {
+                    send_response(socket, {"ERROR", 1001, "USER_NOT_FOUND", {}});
+                    continue;
+                }
+
+                // nlohmann::json user = *user_opt;
+                std::string stored_hash = (*user).value("password_hash", "");
+                if (stored_hash.empty()) {
+                    send_response(socket, {"ERROR", 500, "NO_PASSWORD_HASH", {}});
+                    continue;
+                }
+
+                // Verify password
+                if (crypto_pwhash_str_verify(
+                        stored_hash.c_str(),
+                        password.c_str(),
+                        password.size()
+                    ) != 0)
+                {
+                    send_response(socket, {"ERROR", 1003, "INVALID_PASSWORD", {}});
+                    continue;
+                }
+
+                // Successful login
+                std::cout << "Successful login for user: " << username << "\n";
+                send_response(socket, {"OK", 0, "LOGIN_SUCCESSFUL", {}});
+                continue;
+            }
+
+
+
+            
+            // // Receive message
+            // asio::streambuf buffer;
+            // asio::read_until(socket, buffer, '\n');
+
+            // std::string msg((std::istreambuf_iterator<char>(&buffer)), {});
+            // std::cout << "[server] Received: " << msg << "\n";
+
+            // // Respond
+            // std::string response = "OK\n";
+            // asio::write(socket, asio::buffer(response));
+
+            // std::cout << "[server] Sent response\n";
         }
 
     } catch (std::exception& e) {
