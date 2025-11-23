@@ -63,9 +63,9 @@ struct config {
     std::string root_dir;
 };
 
-struct user_profile {
+struct profile {
     std::string username;
-    std::string directory;
+    std::string user_directory;
 };
 
 config set_up_config(int argc, char* argv[], config& cfg) {
@@ -111,6 +111,8 @@ int main(int argc, char* argv[])
     try {
 
         config server_config;
+        profile user_profie;
+        
         server_config = set_up_config(argc, argv, server_config);
 
         nlohmann::json user_db;
@@ -155,7 +157,20 @@ int main(int argc, char* argv[])
             if (req.cmd == "AUTH") 
             {
                 std::string username = req.args.value("username", "");
-
+                if (username.empty()) 
+                {
+                    send_response(socket, {"OK", 0, "PUBLIC_USER", {}});
+                    user_profie.username = "public";
+                    user_profie.user_directory = server_config.root_dir + "/public";
+                    if (!std::filesystem::exists(user_profie.user_directory)) 
+                    {
+                        
+                        std::filesystem::create_directories(user_profie.user_directory);
+                          
+                    }
+                    continue;
+                }
+                
                 user = find_user(user_db, username);
 
                 if (user != std::nullopt) {
@@ -174,7 +189,7 @@ int main(int argc, char* argv[])
                 std::string username = req.args.value("username", "");
                 std::string password = req.args.value("password", "");
 
-                if (username.empty() || password.empty()) {
+                if (password.empty()) {
                     send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
                     continue;
                 }
@@ -196,7 +211,7 @@ int main(int argc, char* argv[])
                         crypto_pwhash_MEMLIMIT_INTERACTIVE
                     ) != 0)
                 {
-                    send_response(socket, {"ERROR", 500, "HASHING_FAILED", {}});
+                    send_response(socket, {"ERROR", 401, "HASHING_FAILED", {}});
                     continue;
                 }
 
@@ -218,6 +233,8 @@ int main(int argc, char* argv[])
 
                 // Respond to client
                 send_response(socket, {"OK", 0, "USER_REGISTERED", {}});
+                user_profie.username = username;
+                user_profie.user_directory = user_dir;
 
                 continue;
             }
@@ -227,7 +244,7 @@ int main(int argc, char* argv[])
                 std::string username = req.args.value("username", "");
                 std::string password = req.args.value("password", "");
 
-                if (username.empty() || password.empty()) {
+                if (password.empty()) {
                     send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
                     continue;
                 }
@@ -241,7 +258,7 @@ int main(int argc, char* argv[])
                 // nlohmann::json user = *user_opt;
                 std::string stored_hash = (*user).value("password_hash", "");
                 if (stored_hash.empty()) {
-                    send_response(socket, {"ERROR", 500, "NO_PASSWORD_HASH", {}});
+                    send_response(socket, {"ERROR", 401, "NO_PASSWORD_HASH", {}});
                     continue;
                 }
 
@@ -259,6 +276,8 @@ int main(int argc, char* argv[])
                 // Successful login
                 std::cout << "Successful login for user: " << username << "\n";
                 send_response(socket, {"OK", 0, "LOGIN_SUCCESSFUL", {}});
+                user_profie.username = username;
+                user_profie.user_directory = server_config.root_dir + "/" + username;
                 continue;
             }
 

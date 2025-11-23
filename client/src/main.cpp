@@ -129,49 +129,90 @@ int main(int argc, char* argv[]) {
             //TODO: handle different error codes
             if (resp.status == "ERROR") 
             {
+                bool ask_for_password = false;
                 switch (resp.code)
                 {
-                case 1002:
-                    std::cerr << "[error] Username already taken. Please choose another username:\n";
+                case 400:
+                    std::cerr << "[error] Missing fields in request. Please provide correct username:";
                     std::cin >> client_config.username;
                     req.args["username"] = client_config.username;
+                    req.cmd = "AUTH";
+                    break;
+
+                case 401:
+                    std::cerr << "[error] No password hash found for user. Please register first.\nEnter username:\n";
+                    std::cin >> client_config.username;
+                    req.args["username"] = client_config.username;
+                    req.cmd = "REGS";
+                    ask_for_password = true;
                     break;
 
                 case 1001:
-                    std::cerr << "[error] User not found. Please register first.\n";
-                    
-                
-                default:
+                    std::cerr << "[error] User not found. Please register first:\nEnter username:";
+                    std::cin >> client_config.username;
+                    req.args["username"] = client_config.username;
+                    req.cmd = "REGS";
+                    ask_for_password = true;
                     break;
-                }
+
+                case 1002:
+                    std::cerr << "[error] Username already taken. Please choose another username:";
+                    std::cin >> client_config.username;
+                    req.args["username"] = client_config.username;
+                    req.cmd = "REGS";
+                    ask_for_password = true;
+                    break;
                 
-                req.cmd = "REGISTER";
-                req.args["username"] = client_config.username;
-                std::string password;
-                std::cout << "Enter password for new user '" << client_config.username << "': ";
-                std::getline(std::cin, password);
-                req.args["password"] = password;
-                std::cout << "Registering new user...\n";
+                case 1003:
+                    std::cerr << "[error] Invalid password. Please try again.\n";
+                    req.cmd = "LOGN";
+                    req.args["username"] = client_config.username;
+                    ask_for_password = true;
+                    break;
+
+                default:
+                    std::cerr << "[error] Unknown error.\n";
+                    return 1;
+                
+                }
+                if (ask_for_password)
+                {
+                    std::string password;
+                    std::cout << "Enter your password:" << client_config.username << "': ";
+                    std::getline(std::cin, password);
+                    req.args["password"] = password;
+                }
+                std::cout << "Loggining ...\n";
                 if (!send_request(socket, req)) 
                 {
-                    std::cerr << "[error] Failed to send REGISTER request\n";
+                    std::cerr << "[error] Failed to send request\n";
                     return 1;
                 }
             }
 
             if (resp.code == 0)  
             {
-                req.cmd = "LOGIN";
-                req.args["username"] = client_config.username;
-                std::string password;
-                std::cout << "Enter password for new user '" << client_config.username << "': ";
-                std::getline(std::cin, password);
-                req.args["password"] = password;
-                std::cout << "Registering new user...\n";
-                if (!send_request(socket, req)) 
+                if (resp.message == "LOGIN_SUCCESSFUL" || resp.message == "USER_REGISTERED" || resp.message == "PUBLIC_USER") 
                 {
-                    std::cerr << "[error] Failed to send REGISTER request\n";
-                    return 1;
+                    client_config.username = req.args["username"];
+                    logged_in = true;
+                    std::cout << "Logged in successfully as '" << client_config.username << "'\n";
+                    break;
+                }
+                else
+                {
+                    req.cmd = "LOGN";
+                    req.args["username"] = client_config.username;
+                    std::string password;
+                    std::cout << "Enter your password:" << client_config.username << "': ";
+                    std::getline(std::cin, password);
+                    req.args["password"] = password;
+                    std::cout << "Loggining user...\n";
+                    if (!send_request(socket, req)) 
+                    {
+                        std::cerr << "[error] Failed to send request\n";
+                        return 1;
+                    }
                 }
             }
         // while (true) {
@@ -193,6 +234,7 @@ int main(int argc, char* argv[]) {
         //     size_t reply_length = socket.read_some(asio::buffer(reply));
         //     std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
         // }
+        }
     }
     catch (std::exception& e) {
         std::cerr << "[error] " << e.what() << "\n";
