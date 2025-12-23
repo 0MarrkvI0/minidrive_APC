@@ -5,12 +5,12 @@
 
 struct Request {
     std::string cmd;       // napr. "LIST", "UPLOAD", ...
-    nlohmann::json args;   // ďalšie polia (path, size, ... ) si dáš sem
+    nlohmann::json args;   // ďalšie polia (path, size, ... )
 };
 
 struct Response {
     std::string status;    // "OK" alebo "ERROR"
-    int code;              // tvoj error code (0 = success)
+    int code;              // error code (0 = success)
     std::string message;   // human readable message
     nlohmann::json data;   // voliteľné dáta (zoznam súborov, atď.)
 };

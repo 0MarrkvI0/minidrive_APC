@@ -112,10 +112,13 @@ int main(int argc, char* argv[])
 
         config server_config;
         profile user_profie;
-        
+        asio::io_context io;
+        // server configuration
         server_config = set_up_config(argc, argv, server_config);
 
+        // server user database
         nlohmann::json user_db;
+        std::optional<nlohmann::json> user;
 
         std::ifstream f(server_config.root_dir + "/users.json");
         if (f.is_open()) 
@@ -132,24 +135,21 @@ int main(int argc, char* argv[])
             throw std::runtime_error("Failed to initialize libsodium");
         }
     
-        std::optional<nlohmann::json> user;
-        asio::io_context io;
-
-        asio::ip::tcp::acceptor acceptor(
-            io,
-            asio::ip::tcp::endpoint(asio::ip::tcp::v4(), server_config.port)
-        );
+        // server socket setup
+        asio::ip::tcp::acceptor acceptor(io,asio::ip::tcp::endpoint(asio::ip::tcp::v4(), server_config.port));
 
         std::cout << "[server] Running on port " << server_config.port << "\n";
         std::cout << "[server] Root directory: " << server_config.root_dir<< "\n";
 
         asio::ip::tcp::socket socket(io);
         std::cout << "[server] Waiting for client...\n";
-         acceptor.accept(socket);
-            std::cout << "[server] Client connected: "
-                      << socket.remote_endpoint() << "\n";
+        acceptor.accept(socket);
+
+        std::cout << "[server] Client connected: " << socket.remote_endpoint() << "\n";
+
         while (true) 
         {
+            std::cout << "ALOHA" << std::endl;
             Request req = receive_request(socket);
             std::cout << "[server] Received request: " << req.cmd << "\n";
             std::cout << "[server] Args: " << req.args.dump() << "\n";
@@ -157,7 +157,7 @@ int main(int argc, char* argv[])
             if (req.cmd == "AUTH") 
             {
                 std::string username = req.args.value("username", "");
-                if (username.empty()) 
+                if (username == "public") 
                 {
                     send_response(socket, {"OK", 0, "PUBLIC_USER", {}});
                     user_profie.username = "public";
@@ -279,6 +279,12 @@ int main(int argc, char* argv[])
                 user_profie.username = username;
                 user_profie.user_directory = server_config.root_dir + "/" + username;
                 continue;
+            }
+
+            if (req.cmd == "LIST") 
+            {
+                std::cout << "[server] Client requested to quit. Closing connection.\n";
+                break;
             }
 
 

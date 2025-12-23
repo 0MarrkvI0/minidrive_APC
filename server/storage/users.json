@@ -1,9 +1,16 @@
 {
     "users": [
         {
-            
             "password_hash": "$argon2id$v=19$m=65536,t=2,p=1$R3ztFg3FxR5osv2Zz+7PSg$RfiujN+ZIfeSQba59Q07QnFjC0bPqRwDwilz8hWg3gQ",
             "username": "martin"
+        },
+        {
+            "password_hash": "$argon2id$v=19$m=65536,t=2,p=1$1ckHIWpolQk8AyUjBxh+Fw$CN/LDfHJvs235ynMzzZJseIq2RqXVqvGoMQzn26poCM",
+            "username": "kevin"
+        },
+        {
+            "password_hash": "$argon2id$v=19$m=65536,t=2,p=1$1dQePZrma7I2+cnUkrRItA$rZFwPLxIlQq5b9N1A/79PDSLTUrnTKZYgYjHH3ZmUek",
+            "username": "jojo"
         }
     ]
 }

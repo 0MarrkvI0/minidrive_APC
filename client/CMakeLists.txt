@@ -7,4 +7,5 @@ target_link_libraries(client
         asio::asio
         nlohmann_json::nlohmann_json
         minidrive_common
+        spdlog::spdlog_header_only
 )
