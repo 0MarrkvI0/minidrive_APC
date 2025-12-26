@@ -22,8 +22,6 @@ void save_user_db(const nlohmann::json& user_db, const std::string& root_dir)
     std::ofstream out(root_dir + "/users.json");
     out << user_db.dump(4);
 }
-
-
     
 Request receive_request(asio::ip::tcp::socket& socket)
 {
@@ -164,9 +162,7 @@ int main(int argc, char* argv[])
                     user_profie.user_directory = server_config.root_dir + "/public";
                     if (!std::filesystem::exists(user_profie.user_directory)) 
                     {
-                        
-                        std::filesystem::create_directories(user_profie.user_directory);
-                          
+                        std::filesystem::create_directories(user_profie.user_directory);     
                     }
                     continue;
                 }
@@ -184,7 +180,8 @@ int main(int argc, char* argv[])
                 }
             }
 
-            if (req.cmd == "REGS") {
+            if (req.cmd == "REGS") 
+            {
 
                 std::string username = req.args.value("username", "");
                 std::string password = req.args.value("password", "");
@@ -281,11 +278,55 @@ int main(int argc, char* argv[])
                 continue;
             }
 
-            if (req.cmd == "LIST") 
+            if (req.cmd == "LIST")
             {
-                std::cout << "[server] Client requested to quit. Closing connection.\n";
-                break;
+                std::filesystem::path root = std::filesystem::canonical(user_profie.user_directory);
+
+                std::filesystem::path requested = root;
+                if (req.args.contains("path") && req.args["path"].is_string())
+                    requested /= req.args["path"].get<std::string>();
+
+                std::filesystem::path resolved;
+                try {
+                    resolved = std::filesystem::weakly_canonical(requested);
+                } catch (...) {
+                    send_response(socket, {"ERROR", 400, "INVALID_PATH", {}});
+                    continue;
+                }
+
+                if (resolved.native().rfind(root.native(), 0) != 0)
+                {
+                    send_response(socket, {"ERROR", 403, "PATH_OUTSIDE_ROOT", {}});
+                    continue;
+                }
+
+                if (!std::filesystem::exists(resolved))
+                {
+                    send_response(socket, {"ERROR", 404, "PATH_DOES_NOT_EXIST", {}});
+                    continue;
+                }
+                if (!std::filesystem::is_directory(resolved))
+                {
+                    send_response(socket, {"ERROR", 405, "PATH_IS_NOT_DIRECTORY", {}});
+                    continue;
+                }
+
+                std::string msg;
+                for (const auto& entry : std::filesystem::directory_iterator(resolved))
+                {
+                    msg += entry.path().filename().string();
+                    if (entry.is_directory()) msg += "/";
+                    msg += "\n";
+                }
+
+                std::uint64_t size = msg.size();
+                send_response(socket, Response{"OK", 1, "START_LIST", {{"size", size}}});
+                send_message(socket, msg, size, false);
+                send_response(socket, Response{"OK", 0, "END_LIST", {}});
             }
+
+        }
+
 
 
 
@@ -302,7 +343,7 @@ int main(int argc, char* argv[])
             // asio::write(socket, asio::buffer(response));
 
             // std::cout << "[server] Sent response\n";
-        }
+        
 
     } catch (std::exception& e) {
         std::cerr << "[server] Exception: " << e.what() << "\n";

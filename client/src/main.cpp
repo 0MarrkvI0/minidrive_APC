@@ -12,6 +12,38 @@
 
 using asio::ip::tcp;
 
+struct config {
+    std::string username;
+    std::string server_ip;
+    std::string port;
+    std::string log_file;
+};
+
+struct cmd_spec {
+    std::vector<std::string> args;
+    std::size_t min_args;
+    std::size_t max_args;
+};
+
+// list of avialable commands for input parsing 
+// NAME : {MIN,MAX of args}
+const std::unordered_map<std::string, cmd_spec> CMD_LIST = 
+{
+    {"LIST",{ {"path"},0, 1}},
+    {"SYNC",{{"local_path","remote_path"},2,2}},
+    {"UPLOAD",{{"local_path","remote_path"},1,2}},
+    {"DOWNLOAD",{{"remote_path","local_path"},1,2}},
+    {"DELETE",{{"path"},1,1}},
+   
+    {"CD",{{"path"},1,1}},
+    {"MKDIR",{{"path"},1,1}},
+    {"RMDIR",{{"path"},1,1}},
+    {"MOVE",{{"src","dst"},2,2}},
+    {"COPY",{{"src","dst"},2,2}},
+    {"HELP",{{},0,0}},
+    {"EXIT",{{},0,0}}
+};
+
 
 bool send_request(asio::ip::tcp::socket& socket, const Request& req)
 {
@@ -40,24 +72,13 @@ Response receive_response(asio::ip::tcp::socket& socket)
 
     nlohmann::json j = nlohmann::json::parse(line);
     Response resp = j.get<Response>();
+    std::cout << "[client] Received response: " << resp.status << " " << resp.code << " " << resp.message << "\n";
+    std::cout << "[client] Data: " << resp.data.dump() << "\n";
     return resp;
 }
 
-auto read_line_trim = [](std::string& out){
-    std::getline(std::cin, out);
-    if (!out.empty() && out.back() == '\r') out.pop_back(); // ak by bol CRLF
-};
-
-
-struct config {
-    std::string username;
-    std::string server_ip;
-    std::string port;
-    std::string log_file;
-};
-
-config set_up_config(int argc, char* argv[], config& cfg) {
-
+config set_up_config(int argc, char* argv[], config& cfg) 
+{
     std::string server_arg = argv[1];
     size_t at_pos = server_arg.find('@');
     size_t colon_pos = server_arg.find(':');
@@ -132,45 +153,52 @@ config set_up_config(int argc, char* argv[], config& cfg) {
     return cfg;
 }
 
+std::optional<std::string> parse_command(const std::string& line, Request& req) 
+{
+    std::istringstream iss(line);
 
-// optimal std::string create_request(const std::string& cmd, Request& req, uint64_t& byte_count)
-// {
-//     std::istringstream iss(cmd);
-//     std::string token;
+    iss >> req.cmd;
+    if (req.cmd.empty())
+        throw std::runtime_error("Empty command");
 
-//     // prvé slovo = command
-//     if (!(iss >> token)) {
-//         return; // prázdny input
-//     }
+    std::vector<std::string> argument_list;
+    std::string curr_arg;
+    while (iss >> curr_arg) argument_list.push_back(curr_arg);
 
-//     req.cmd = token;
-//     req.args = nlohmann::json::object();
+    auto curr_cmd = CMD_LIST.find(req.cmd);
+    if (curr_cmd == CMD_LIST.end())
+        throw std::runtime_error("Unknown command: " + req.cmd);
 
+    const auto& cmd_info = curr_cmd->second;
+    if (argument_list.size() < cmd_info.min_args ||
+        argument_list.size() > cmd_info.max_args)
+        throw std::runtime_error("Invalid arg count for " + req.cmd);
 
-//     if (req.cmd == "UPLOAD") 
-//     {
-//         if (iss >> token) 
-//         {
-//             req.args["byte_count"] = std::stoull(token);
-//         }
-//         if (iss >> token) 
-//         {
-//             req.args["filename"] = token;
-//         }
-//         return;
-//     }
-//     else
-//     {
-//         // zvyšok = argumenty
-//         int index = 0;
-//         while (iss >> token) {
-//         req.args["arg" + std::to_string(index++)] = token;
-//     }
-//     }
-// }  
+    req.args = nlohmann::json::object();
 
+    for (size_t i = 0; i < argument_list.size(); ++i) 
+    {
+        req.args[cmd_info.args[i]] = argument_list[i];
+    }
 
+    if (req.args.contains("local_path") && !(req.cmd == "DOWNLOAD"))
+    {
+        if (req.args["local_path"].is_string() == false)
+        {
+            throw std::runtime_error("Invalid local_path argument");
+        }
 
+        std::filesystem::path loc_path = req.args["local_path"].get<std::string>();
+        if (!std::filesystem::exists(loc_path)) 
+        {
+            throw std::runtime_error("Source path does not exist: " + loc_path.string());
+        }
+    }
+
+    return (req.args.contains("local_path") && req.args["local_path"].is_string())
+        ? std::make_optional(req.args["local_path"].get<std::string>())
+        : std::nullopt;
+}
 
 int main(int argc, char* argv[]) {
 
@@ -306,7 +334,6 @@ int main(int argc, char* argv[]) {
                     logged_in = true;
                     std::cout << "Logged in successfully as '" << client_config.username << "'\n";
                     spdlog::info("Logged in successfully as '{}'", client_config.username);
-                    break;
                 }
                 else
                 {
@@ -325,37 +352,81 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-        std::cout << "Wellcome, " << client_config.username << "!\n";
-        while (true) {
+        std::cout << "Welcome, " << client_config.username << "!\n";
+        while (true) 
+        {
             std::string message;
             read_line_trim(message);
             if (message.empty()) continue;
-            
-            std::array<char, 64*1024> buf;
-            uint64_t remaining = 0;
 
-            // message parsing
-            // create_request(message, req,remaining);
+            std::optional<std::string> src_path_opt;
+            try {
+                src_path_opt = parse_command(message, req);
+            } catch (const std::exception& e) {
+                std::cerr << "[error] " << e.what() << "\n";
+                spdlog::error("{}", e.what());
+                continue;
+            }
 
-            if (!send_request(socket, req)) {
+            if (src_path_opt) 
+            {
+                req.args.erase("local_path");
+                std::cout << "Source path: " << *src_path_opt << "\n";
+            }
+
+            if (!send_request(socket, req)) 
+            {
                 std::cerr << "[error] Failed to send request\n";
                 spdlog::error("Failed to send request");
                 continue;
             }
-            asio::write(socket, asio::buffer(message));
+
+            while (true)
+            { 
+                resp = receive_response(socket);
+                if(resp.status == "OK" && resp.code == 1)
+                {
+                    std::uint64_t size = resp.data.at("size").get<std::uint64_t>();
+                    if (req.cmd == "LIST")
+                    {
+                        auto msg = receive_message(socket, "", size, false);
+                        if (msg) {
+                            std::cout << *msg << "\n";
+                        } else {
+                            std::cout << "[client] no message\n";
+                        }
+                        continue; 
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            
+          
+            // asio::write(socket, asio::buffer(message));
+
+
+            // std::size_t sent = 0;
+            // while (sent < len) {
+            //     auto n = ::send(fd, buf + sent, len - sent, 0);
+            //     if (n <= 0) { /* error/closed */ }
+            //     sent += static_cast<std::size_t>(n);
+            // }
 
 
          
-            do {
-                Response resp = receive_response(socket);
-                std::cout << "[server] Response: " << resp.status
-                        << " (" << resp.code << "): " << resp.message << "\n";
-            } while (socket.available() > 0);
+            // do {
+            //     Response resp = receive_response(socket);
+            //     std::cout << "[server] Response: " << resp.status
+            //             << " (" << resp.code << "): " << resp.message << "\n";
+            // } while (socket.available() > 0);
 
             // Receive echo
-            char reply[1024];
-            size_t reply_length = socket.read_some(asio::buffer(reply));
-            std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
+            // char reply[1024];
+            // size_t reply_length = socket.read_some(asio::buffer(reply));
+            // std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
         }
         }
     }
