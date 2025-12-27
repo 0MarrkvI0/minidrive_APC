@@ -13,3 +13,8 @@ AUTH username
 0
 resp.message == "LOGIN_SUCCESSFUL" || resp.message == "USER_REGISTERED" || resp.message == "PUBLIC_USER")
 req.cmd = "LOGN";
+
+
+1. AUTH
+2. RESUME (DOWN/UP)
+3. CMD

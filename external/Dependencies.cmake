@@ -1,7 +1,5 @@
 include(FetchContent)
-
-
-
+find_package(OpenSSL REQUIRED)
 
 # ASIO (header-only)
 FetchContent_Declare(

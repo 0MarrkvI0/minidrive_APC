@@ -1,5 +1,6 @@
 #include "protocol.hpp"
 
+
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -11,6 +12,8 @@
 #include <fstream>
 
 using asio::ip::tcp;
+
+const std::string TRANSFERS_PATH = "client/transfers";
 
 struct config {
     std::string username;
@@ -73,7 +76,7 @@ Response receive_response(asio::ip::tcp::socket& socket)
     nlohmann::json j = nlohmann::json::parse(line);
     Response resp = j.get<Response>();
     std::cout << "[client] Received response: " << resp.status << " " << resp.code << " " << resp.message << "\n";
-    std::cout << "[client] Data: " << resp.data.dump() << "\n";
+    std::cout << "[client] Data: " << (resp.data.is_null() ? "none" : resp.data.dump())<< "\n";
     return resp;
 }
 
@@ -153,7 +156,7 @@ config set_up_config(int argc, char* argv[], config& cfg)
     return cfg;
 }
 
-std::optional<std::string> parse_command(const std::string& line, Request& req) 
+void parse_command(const std::string& line, Request& req) 
 {
     std::istringstream iss(line);
 
@@ -191,13 +194,9 @@ std::optional<std::string> parse_command(const std::string& line, Request& req)
         std::filesystem::path loc_path = req.args["local_path"].get<std::string>();
         if (!std::filesystem::exists(loc_path)) 
         {
-            throw std::runtime_error("Source path does not exist: " + loc_path.string());
+            throw std::runtime_error("Local path does not exist: " + loc_path.string());
         }
     }
-
-    return (req.args.contains("local_path") && req.args["local_path"].is_string())
-        ? std::make_optional(req.args["local_path"].get<std::string>())
-        : std::nullopt;
 }
 
 int main(int argc, char* argv[]) {
@@ -353,6 +352,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         std::cout << "Welcome, " << client_config.username << "!\n";
+        //TODO: init transfer dir
         while (true) 
         {
             std::string message;
@@ -360,19 +360,30 @@ int main(int argc, char* argv[]) {
             if (message.empty()) continue;
 
             std::optional<std::string> src_path_opt;
-            try {
-                src_path_opt = parse_command(message, req);
-            } catch (const std::exception& e) {
+            try 
+            {
+                parse_command(message, req);
+            } catch (const std::exception& e) 
+            {
                 std::cerr << "[error] " << e.what() << "\n";
                 spdlog::error("{}", e.what());
                 continue;
             }
 
-            if (src_path_opt) 
+            if (req.cmd == "UPLOAD")
             {
-                req.args.erase("local_path");
-                std::cout << "Source path: " << *src_path_opt << "\n";
+                std::filesystem::path local_path = req.args["local_path"].get<std::string>();
+                req.args["offset"] = 0;
+                // req.args["offset"] = 3;
+                req.args["size"] = std::filesystem::file_size(local_path);
+                req.args["hash"] = "sha256_" + sha256_file(local_path);
             }
+
+            if (req.cmd == "DOWNLOAD")
+            {
+
+            }
+             
 
             if (!send_request(socket, req)) 
             {
@@ -386,16 +397,29 @@ int main(int argc, char* argv[]) {
                 resp = receive_response(socket);
                 if(resp.status == "OK" && resp.code == 1)
                 {
-                    std::uint64_t size = resp.data.at("size").get<std::uint64_t>();
-                    if (req.cmd == "LIST")
+                    // std::uint64_t size = resp.data.at("size").get<std::uint64_t>();
+                    // if (req.cmd == "LIST")
+                    // {
+                    //     auto msg = receive_message(socket, "", size, false);
+                    //     if (msg) {
+                    //         std::cout << *msg << "\n";
+                    //     } else {
+                    //         std::cout << "[client] no message\n";
+                    //     }
+                    //     continue; 
+                    // }
+                    if (req.cmd == "UPLOAD")
                     {
-                        auto msg = receive_message(socket, "", size, false);
-                        if (msg) {
-                            std::cout << *msg << "\n";
-                        } else {
-                            std::cout << "[client] no message\n";
-                        }
-                        continue; 
+                        std::cout << "somtu?" << std::endl;
+                        send_message
+                        (
+                            socket,
+                            req.args["local_path"].get<std::string>(),
+                            req.args["size"].get<std::uint64_t>(),
+                            req.args["offset"].get<std::uint64_t>(),
+                            true
+                        );
+
                     }
                 }
                 else

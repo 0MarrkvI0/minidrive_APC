@@ -1,4 +1,5 @@
 #include "protocol.hpp"
+#include "meta.hpp"
 
 #include <asio.hpp>
 #include <iostream>
@@ -7,6 +8,17 @@
 #include <fstream>
 #include <sodium.h>
 
+const std::string USER_DB_FILEPATH = "/users.json";
+
+struct config {
+    int port;
+    std::string root_dir;
+};
+
+struct profile {
+    std::string username;
+    std::string user_directory;
+};
 
 std::optional<nlohmann::json> find_user(const nlohmann::json& db, const std::string& username) {
     for (const auto& u : db["users"]) {
@@ -19,7 +31,7 @@ std::optional<nlohmann::json> find_user(const nlohmann::json& db, const std::str
 
 void save_user_db(const nlohmann::json& user_db, const std::string& root_dir)
 {
-    std::ofstream out(root_dir + "/users.json");
+    std::ofstream out(root_dir + USER_DB_FILEPATH);
     out << user_db.dump(4);
 }
     
@@ -54,17 +66,61 @@ bool send_response(asio::ip::tcp::socket& socket, const Response& resp)
     }
 }
 
+//TODO: overrvriten file not
+bool check_path 
+(    
+    const std::filesystem::path& root_dir,
+    const std::filesystem::path& input_path,
+    const std::string& type, // "dir" or "file"
+    asio::ip::tcp::socket& socket
+)
+{
+    std::filesystem::path root;
+    try {
+        root = std::filesystem::canonical(root_dir);
+    } catch (...) {
+        send_response(socket, {"ERROR", 400, "INVALID_ROOT", {}});
+        return false;
+    }
+
+    std::filesystem::path requested = root / input_path;
+
+    std::filesystem::path resolved;
+    try {
+        resolved = std::filesystem::weakly_canonical(requested);
+    } catch (...) {
+        send_response(socket, {"ERROR", 400, "INVALID_PATH", {}});
+        return false;
+    }
+
+    if (resolved.native().rfind(root.native(), 0) != 0)
+    {
+        send_response(socket, {"ERROR", 403, "PATH_OUTSIDE_ROOT", {}});
+        return false;
+    }
+
+    if (!std::filesystem::exists(resolved))
+    {
+        send_response(socket, {"ERROR", 404, "PATH_DOES_NOT_EXIST", {}});
+        return false;
+    }
+
+    if (type == "dir" && !std::filesystem::is_directory(resolved))
+    {
+        send_response(socket, {"ERROR", 405, "PATH_IS_NOT_DIRECTORY", {}});
+        return false;
+    }
+
+    if (type == "file" && !std::filesystem::is_regular_file(resolved))
+    {
+        send_response(socket, {"ERROR", 405, "PATH_IS_NOT_FILE", {}});
+        return false;
+    }
+
+    return true;
+}
 
 
-struct config {
-    int port;
-    std::string root_dir;
-};
-
-struct profile {
-    std::string username;
-    std::string user_directory;
-};
 
 config set_up_config(int argc, char* argv[], config& cfg) {
 
@@ -118,7 +174,7 @@ int main(int argc, char* argv[])
         nlohmann::json user_db;
         std::optional<nlohmann::json> user;
 
-        std::ifstream f(server_config.root_dir + "/users.json");
+        std::ifstream f(server_config.root_dir + USER_DB_FILEPATH);
         if (f.is_open()) 
         {
             f >> user_db;
@@ -144,7 +200,7 @@ int main(int argc, char* argv[])
         acceptor.accept(socket);
 
         std::cout << "[server] Client connected: " << socket.remote_endpoint() << "\n";
-
+        
         while (true) 
         {
             std::cout << "ALOHA" << std::endl;
@@ -321,9 +377,53 @@ int main(int argc, char* argv[])
 
                 std::uint64_t size = msg.size();
                 send_response(socket, Response{"OK", 1, "START_LIST", {{"size", size}}});
-                send_message(socket, msg, size, false);
+                // send_message(socket, msg, size, false);
                 send_response(socket, Response{"OK", 0, "END_LIST", {}});
             }
+
+        if (req.cmd == "UPLOAD")
+        {
+            FileTransferMeta metafile;
+
+            if (req.args.contains("remote_path") && !req.args["remote_path"].is_null())
+            {
+                if (!check_path(
+                        user_profie.user_directory,
+                        req.args["remote_path"].get<std::string>(),
+                        "dir",
+                        socket))
+                {
+                    continue;
+                }
+
+                metafile.remote_path = req.args["remote_path"].get<std::string>();
+            }
+            else
+            {
+                metafile.remote_path = user_profie.user_directory;
+            }
+
+            metafile.local_path = req.args["local_path"].get<std::string>();
+            metafile.cmd = req.cmd;
+            metafile.file_hash = req.args["hash"].get<std::string>();
+            metafile.offset = req.args["offset"].get<std::uint64_t>();
+            metafile.file_size = req.args["size"].get<std::uint64_t>();
+            send_response(socket, Response{"OK", 1, "START_UPLOAD", {}});
+            while (1)
+            {
+                // Receive message
+                asio::streambuf buffer;
+                asio::read_until(socket, buffer, '\n');
+
+                std::string msg((std::istreambuf_iterator<char>(&buffer)), {});
+                std::cout << "[server] Received: " << msg << "\n";
+            }
+           
+        }
+
+
+
+            
 
         }
 

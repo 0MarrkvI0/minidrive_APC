@@ -6,4 +6,5 @@ target_include_directories(minidrive_common INTERFACE
 
 target_link_libraries(minidrive_common INTERFACE
     nlohmann_json::nlohmann_json
+    OpenSSL::Crypto
 )
