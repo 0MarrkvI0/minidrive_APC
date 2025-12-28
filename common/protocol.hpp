@@ -10,13 +10,72 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <openssl/evp.h>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
+
+
 #include "meta.hpp"
 
+
+inline std::string sha256_file(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        throw std::runtime_error("Cannot open file for hashing");
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx)
+        throw std::runtime_error("EVP_MD_CTX_new failed");
+
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1)
+    {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestInit_ex failed");
+    }
+
+    char buffer[8192];
+    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0)
+    {
+        if (EVP_DigestUpdate(ctx, buffer, file.gcount()) != 1)
+        {
+            EVP_MD_CTX_free(ctx);
+            throw std::runtime_error("EVP_DigestUpdate failed");
+        }
+    }
+
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+
+    if (EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1)
+    {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+
+    EVP_MD_CTX_free(ctx);
+
+    std::ostringstream oss;
+    for (unsigned int i = 0; i < hash_len; ++i)
+        oss << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(hash[i]);
+
+    return oss.str();
+}
 
 struct Request 
 {
     std::string cmd;       // napr. "LIST", "UPLOAD", ...
     nlohmann::json args;   // ďalšie polia (path, size, ... )
+
+    void clear() 
+    {
+        cmd.clear();
+        args.clear();
+    }
 };
 
 struct Response 
@@ -25,6 +84,14 @@ struct Response
     int code;              // error code (0 = success)
     std::string message;   // human readable message
     nlohmann::json data;   // voliteľné dáta (zoznam súborov, atď.)
+
+    void clear() 
+    {
+        status.clear();
+        code = 0;
+        message.clear();
+        data.clear();
+    }
 };
 
 inline void to_json(nlohmann::json& j, const Request& r) 
@@ -78,7 +145,7 @@ constexpr std::size_t CHUNK = 64 * 1024;
 inline void send_message
 (
     asio::ip::tcp::socket& s,
-    // message or filepath
+    // message alebo filepath
     const std::string& message,
     std::uint64_t total_size,
     std::uint64_t offset,
@@ -171,73 +238,171 @@ inline void remove_meta_file(const FileTransferMeta& meta, const std::string& me
     std::filesystem::remove(get_meta_file_path(meta, meta_path), ec);
 }
 
+inline bool ends_with(std::string_view s, std::string_view suf)
+{
+    return s.size() >= suf.size() && s.substr(s.size() - suf.size()) == suf;
+}
+
 
 inline std::optional<std::string> receive_message
 (
     asio::ip::tcp::socket& s,
     FileTransferMeta& meta,
-    const std::string& meta_path,
-    bool is_public,
-    bool is_file
+    std::string meta_path,
+    const bool is_public,
+    const bool is_file
 )
 {
     if (is_file)
     {
-        apply_filename_to_remote_path(meta);
-        std::filesystem::path out_path(meta.remote_path);
+        // cesta k suboru s ktorou budeme pracovat
+        std::filesystem::path p = meta.remote_path;
+        std::error_code ec;
+        // kontrola existencie suboru, error si zapiseme do ec
+        bool exists = false;
 
+        if (std::filesystem::exists(p, ec)) 
+        {
+            if (!ec && std::filesystem::is_regular_file(p, ec)) 
+            {
+                exists = true;
+            }
+        }
+
+        if (ec) 
+        {
+            throw std::runtime_error(ec.message());
+        }
+
+        // klient poslal .part
+        if (ends_with(meta.remote_path, ".part"))
+        {
+            if (!exists)
+            {
+                // .part neexistuje = nový upload
+                meta.offset = 0;
+            }
+            // inak offset zostava rovnaky
+        }
+        //klient poslal original file bez .part
+        else
+        {
+            // finálny neexistuje = budeme zapisovať do .part
+            // uz by bol inak zachyteny (ak by bol rovnaky)
+            meta.remote_path += ".part";
+            p = meta.remote_path;  
+            meta.offset = 0;
+        }
+     
+        std::filesystem::path out_path(meta.remote_path);
         // otvor / vytvor cieľový súbor
         std::fstream out(out_path, std::ios::in | std::ios::out | std::ios::binary);
         if (!out)
         {
-            std::ofstream create(out_path, std::ios::binary);
-            if (!create) return std::nullopt;
+            std::ofstream create(out_path, std::ios::binary | std::ios::app);
+            if (!create)
+            {
+                throw std::runtime_error("Failed to create file.");
+            }
             create.close();
+            out.clear();
             out.open(out_path, std::ios::in | std::ios::out | std::ios::binary);
         }
-        if (!out) return std::nullopt;
+        if (!out)
+        {
+            throw std::runtime_error("Failed to open file.");
+        } 
 
-        // resume seek
+
+        auto size = std::filesystem::file_size(out_path);
+        if (meta.offset > size)
+        {
+            throw std::runtime_error("Offset larger than file size.");
+        }
+
+        // resume seek (nastavenie offsetu pri resume)
         out.seekp(static_cast<std::streamoff>(meta.offset), std::ios::beg);
-        if (!out) return std::nullopt;
+        if (!out)
+        {
+            throw std::runtime_error("Failed to seek in file.");
+        } 
 
         std::array<char, CHUNK> buf;
-
         std::uint64_t remaining = meta.file_size - meta.offset;
         std::uint64_t bytes_since_meta_write = 0;
+        // meta file sa bude ukladat do samostatneho transfer priecinka
+        std::filesystem::path tr_p(meta_path);
+        tr_p /= "transfer";
+        meta_path = tr_p.string();
+
 
         while (remaining > 0)
         {
             std::size_t want = std::min<std::uint64_t>(remaining, buf.size());
 
-            std::error_code ec;
             std::size_t got = asio::read(s, asio::buffer(buf.data(), want), ec);
-            if (ec || got == 0) return std::nullopt;
-
+            if (ec || got == 0) 
+            {
+                throw std::runtime_error("Socket read failed: " + ec.message());
+            }
+        
             out.write(buf.data(), (std::streamsize)got);
-            if (!out) return std::nullopt;
+            if (!out) 
+            {
+                throw std::runtime_error("File write failed.");
+            }
 
             remaining -= got;
 
-            if (is_public)
+            if (!is_public)
             {
+                // update metadat
                 meta.offset += got;
                 meta.last_update = (std::int64_t)std::time(nullptr);
 
                 bytes_since_meta_write += got;
                 if (bytes_since_meta_write >= 256 * 1024 || remaining == 0)
                 {
+                    // zapis do metafilu aktualne info
                     if (!write_meta_file(meta, meta_path))
-                        return std::nullopt;
+                    {
+                        throw std::runtime_error("MetaFile write failed.");
+                    }
                     bytes_since_meta_write = 0;
                 }
             }
         }
 
-        // ✅ COMPLETE → zmaž .meta
-        if (is_public && meta.offset == meta.file_size)
+        // po dokonceni sa zmaze meta 
+        if (!is_public && meta.offset == meta.file_size)
+        {
             remove_meta_file(meta, meta_path);
+        }
+        
+        out.flush();
+        out.close();   
+        //odstrani sa .path ext
+        std::filesystem::path final_filepath = p;   
+        final_filepath.replace_extension("");             
+        std::filesystem::rename(p, final_filepath, ec);
+        if (ec) 
+        {
+            throw std::runtime_error("Rename failed: " + ec.message());
+        }
 
+        // skontrolujeme integritu suboru ak je zla zmazeme subor
+        const std::string computed_hash = "sha256_" + sha256_file(final_filepath);
+
+        if (computed_hash != meta.file_hash)
+        {
+            std::error_code ec;
+            std::filesystem::remove(final_filepath, ec);
+
+            throw std::runtime_error(
+                "Corrupted transfer: hash mismatch (expected " +
+                meta.file_hash + ", got " + computed_hash + ")"
+            );
+        }
         return std::nullopt;
     }
     else
@@ -254,7 +419,10 @@ inline std::optional<std::string> receive_message
 
             std::error_code ec;
             std::size_t got = asio::read(s, asio::buffer(result.data() + off, want), ec);
-            if (ec || got == 0) return std::nullopt;
+            if (ec || got == 0)
+            {
+                throw std::runtime_error(ec.message());
+            }
 
             off += got;
             remaining -= got;
@@ -267,57 +435,9 @@ inline std::optional<std::string> receive_message
 
 
 
-#include <openssl/evp.h>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
-#include <stdexcept>
 
-inline std::string sha256_file(const std::filesystem::path& path)
-{
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-        throw std::runtime_error("Cannot open file for hashing");
 
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx)
-        throw std::runtime_error("EVP_MD_CTX_new failed");
 
-    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1)
-    {
-        EVP_MD_CTX_free(ctx);
-        throw std::runtime_error("EVP_DigestInit_ex failed");
-    }
-
-    char buffer[8192];
-    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0)
-    {
-        if (EVP_DigestUpdate(ctx, buffer, file.gcount()) != 1)
-        {
-            EVP_MD_CTX_free(ctx);
-            throw std::runtime_error("EVP_DigestUpdate failed");
-        }
-    }
-
-    unsigned char hash[EVP_MAX_MD_SIZE];
-    unsigned int hash_len = 0;
-
-    if (EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1)
-    {
-        EVP_MD_CTX_free(ctx);
-        throw std::runtime_error("EVP_DigestFinal_ex failed");
-    }
-
-    EVP_MD_CTX_free(ctx);
-
-    std::ostringstream oss;
-    for (unsigned int i = 0; i < hash_len; ++i)
-        oss << std::hex << std::setw(2) << std::setfill('0')
-            << static_cast<int>(hash[i]);
-
-    return oss.str();
-}
 
 inline std::optional<std::filesystem::path>find_meta_by_hash
 (

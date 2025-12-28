@@ -15,6 +15,36 @@ using asio::ip::tcp;
 
 const std::string TRANSFERS_PATH = "client/transfers";
 
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/basic_file_sink.h>
+
+//TODO: logovanie do suboru aj na konzolu
+void init_logging(const std::string& log_file)
+{
+    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    auto file_sink    = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+                            log_file, true); // append
+
+    console_sink->set_level(spdlog::level::info);   // CMD
+    file_sink->set_level(spdlog::level::debug);    // FILE
+
+    std::vector<spdlog::sink_ptr> sinks { console_sink, file_sink };
+
+    auto logger = std::make_shared<spdlog::logger>(
+        "client_logger",
+        sinks.begin(),
+        sinks.end()
+    );
+
+    spdlog::set_default_logger(logger);
+    spdlog::set_level(spdlog::level::debug);
+    spdlog::flush_on(spdlog::level::info);
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+}
+
+
 struct config {
     std::string username;
     std::string server_ip;
@@ -57,6 +87,8 @@ bool send_request(asio::ip::tcp::socket& socket, const Request& req)
         serialized += '\n';
 
         asio::write(socket, asio::buffer(serialized));
+        std::cout << "[client] Send request: " << req.cmd << "\n";
+        std::cout << "[client] Args: " << req.args.dump() << "\n";
         return true;
     } catch (std::exception& e) {
         std::cerr << "[error] Failed to send request: " << e.what() << "\n";
@@ -184,20 +216,141 @@ void parse_command(const std::string& line, Request& req)
         req.args[cmd_info.args[i]] = argument_list[i];
     }
 
-    if (req.args.contains("local_path") && !(req.cmd == "DOWNLOAD"))
+    if (req.args.contains("local_path"))
     {
         if (req.args["local_path"].is_string() == false)
         {
-            throw std::runtime_error("Invalid local_path argument");
+                throw std::runtime_error("Invalid local_path argument");
         }
-
         std::filesystem::path loc_path = req.args["local_path"].get<std::string>();
         if (!std::filesystem::exists(loc_path)) 
         {
-            throw std::runtime_error("Local path does not exist: " + loc_path.string());
+                throw std::runtime_error("Local path does not exist: " + loc_path.string());
+        }
+
+        if (req.cmd == "DOWNLOAD")
+        {
+            if (!std::filesystem::is_directory(loc_path))
+            {
+                throw std::runtime_error("Local path is a file, expected dir: " + loc_path.string());
+            }
+        }
+        else
+        {
+            if (!std::filesystem::is_regular_file(loc_path))
+            {
+                throw std::runtime_error("Local path is a dir, expected file: " + loc_path.string());
+            }
+        }      
+    }
+}
+
+void handle_upload(asio::ip::tcp::socket& socket, Request& req)
+{
+    std::filesystem::path local_path = req.args["local_path"].get<std::string>();
+    
+    if (!req.args.contains("resume"))
+    {
+        req.args["offset"] = 0; // alebo načítaj z meta ak robíš resume
+        req.args["size"]   = std::filesystem::file_size(local_path);
+        req.args["hash"]   = "sha256_" + sha256_file(local_path);
+    }
+
+    if (!send_request(socket, req)) 
+    {
+        throw std::runtime_error("Failed to send request");
+    }
+
+    for (;;)
+    {
+        Response resp = receive_response(socket);
+
+        if (resp.status == "OK")
+        {
+            if (resp.code == 1)
+            {
+                // zaciname posielat v loope
+                send_message(
+                    socket,
+                    req.args["local_path"].get<std::string>(),
+                    req.args["size"].get<std::uint64_t>(),
+                    req.args["offset"].get<std::uint64_t>(),
+                    true
+                ); 
+            }
+            // koniec success upload
+            if (resp.code == 0) {return;}
+
+        }
+        else
+        {
+            // ked resp.status = ERROR
+            std::string err =
+                "Server error: " + resp.status +
+                " "+ std::to_string(resp.code) +
+                " " + resp.message +
+                " " + resp.data.dump();
+            throw std::runtime_error(err);
         }
     }
 }
+
+void handle_download(asio::ip::tcp::socket& socket, Request& req)
+{
+    std::filesystem::path local_path;
+
+    if (!req.args.contains("local_path"))
+    {
+        std::filesystem::path remote_path = std::filesystem::path(req.args["remote_path"].get<std::string>());
+        std::string filename = remote_path.filename().string();
+        // current directory + filename z remote_path
+        local_path = std::filesystem::current_path() / filename;
+    }
+    else
+    {
+        local_path = std::filesystem::path(req.args["local_path"].get<std::string>());
+    }
+  
+    
+    if (!send_request(socket, req)) 
+    {
+        throw std::runtime_error("Failed to send request");
+    }
+
+    for (;;)
+    {
+        Response resp = receive_response(socket);
+
+        if (resp.status == "OK")
+        {
+            if (resp.code == 1)
+            {
+                // zaciname posielat v loope
+                send_message(
+                    socket,
+                    req.args["local_path"].get<std::string>(),
+                    req.args["size"].get<std::uint64_t>(),
+                    req.args["offset"].get<std::uint64_t>(),
+                    true
+                ); 
+            }
+            // koniec success upload
+            if (resp.code == 0) {return;}
+
+        }
+        else
+        {
+            // ked resp.status = ERROR
+            std::string err =
+                "Server error: " + resp.status +
+                " "+ std::to_string(resp.code) +
+                " " + resp.message +
+                " " + resp.data.dump();
+            throw std::runtime_error(err);
+        }
+    }
+}
+
 
 int main(int argc, char* argv[]) {
 
@@ -252,14 +405,12 @@ int main(int argc, char* argv[]) {
             spdlog::error("Failed to send AUTH request");
             return 1;
         }
+        Response resp;
 
         // authentication loop
         while (!logged_in) 
         {
-            Response resp = receive_response(socket);
-            std::cout << "[server] Response: " << resp.status
-                    << " (" << resp.code << "): " << resp.message << "\n";
-            
+            resp = receive_response(socket);
 
             //TODO: handle different error codes
             if (resp.status == "ERROR") 
@@ -327,12 +478,59 @@ int main(int argc, char* argv[]) {
 
             if (resp.code == 0)  
             {
+                // uspesne prihlasenie
                 if (resp.message == "LOGIN_SUCCESSFUL" || resp.message == "USER_REGISTERED" || resp.message == "PUBLIC_USER") 
                 {
+                    // uloazenie mena usera do configu
                     client_config.username = req.args["username"];
                     logged_in = true;
-                    std::cout << "Logged in successfully as '" << client_config.username << "'\n";
                     spdlog::info("Logged in successfully as '{}'", client_config.username);
+                    // ak su resume uploads tak nam pridu v jsone ako data["resumed_transfers"]
+                    if 
+                    (
+                        resp.data.contains("resumed_transfers") &&
+                        !resp.data["resumed_transfers"].is_null() &&
+                        !resp.data["resumed_transfers"].empty()
+                    )
+                    {
+                        std::cout << "Incomplete upload/downloads detected, resume? (y/n):\n";
+                        std::string ans; std::getline(std::cin, ans);
+
+                        if (!ans.empty() && (ans[0] == 'y' || ans[0] == 'Y'))
+                        {
+                            // postupne sa obnovia resumed uploads
+                            for (size_t i = 0; i < resp.data["resumed_transfers"].size(); ++i)
+                            {
+                                req.clear();                            
+                                const auto& t = resp.data["resumed_transfers"][i]; 
+
+                                // type je "UPLOAD" / "DOWNLOAD"
+                                req.cmd = t.at("type").get<std::string>();
+
+                                // args naplníme z JSONu
+                                req.args["hash"] = t.at("file_hash");
+                                req.args["size"] = t.at("file_size");
+                                req.args["offset"] = t.at("offset");
+                                req.args["remote_path"] = t.at("remote_path");
+                                req.args["local_path"] = t.at("local_path");
+                                req.args["resume"] = true;
+
+                                std::cout << "[resume] " << req.cmd << " from offset=" 
+                                        << req.args["offset"] << "\n";
+
+                                try
+                                {
+                                    handle_upload(socket,req);
+                                }
+                                catch(const std::exception& e)
+                                {
+                                    std::cerr << "[error] " << e.what() << "\n";
+                                    spdlog::error("{}", e.what());
+                                }
+                            }
+                            std::cout << resp.data["resumed_transfers"] << std::endl;
+                        }
+                    }
                 }
                 else
                 {
@@ -351,15 +549,18 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+        }
         std::cout << "Welcome, " << client_config.username << "!\n";
         //TODO: init transfer dir
         while (true) 
         {
+            req.clear();
             std::string message;
             read_line_trim(message);
             if (message.empty()) continue;
 
-            std::optional<std::string> src_path_opt;
+            // std::optional<std::string> src_path_opt;
+            
             try 
             {
                 parse_command(message, req);
@@ -370,63 +571,82 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (req.cmd == "UPLOAD")
+            try
             {
-                std::filesystem::path local_path = req.args["local_path"].get<std::string>();
-                req.args["offset"] = 0;
-                // req.args["offset"] = 3;
-                req.args["size"] = std::filesystem::file_size(local_path);
-                req.args["hash"] = "sha256_" + sha256_file(local_path);
+                if (req.cmd == "UPLOAD")
+                {
+                    handle_upload(socket,req);
+                }
+                if (req.cmd == "DOWNLOAD")
+                {
+
+                }
             }
-
-            if (req.cmd == "DOWNLOAD")
+            catch(const std::exception& e)
             {
-
-            }
-             
-
-            if (!send_request(socket, req)) 
-            {
-                std::cerr << "[error] Failed to send request\n";
-                spdlog::error("Failed to send request");
+                std::cerr << "[error] " << e.what() << "\n";
+                spdlog::error("{}", e.what());
                 continue;
             }
+            
 
-            while (true)
-            { 
-                resp = receive_response(socket);
-                if(resp.status == "OK" && resp.code == 1)
-                {
-                    // std::uint64_t size = resp.data.at("size").get<std::uint64_t>();
-                    // if (req.cmd == "LIST")
-                    // {
-                    //     auto msg = receive_message(socket, "", size, false);
-                    //     if (msg) {
-                    //         std::cout << *msg << "\n";
-                    //     } else {
-                    //         std::cout << "[client] no message\n";
-                    //     }
-                    //     continue; 
-                    // }
-                    if (req.cmd == "UPLOAD")
-                    {
-                        std::cout << "somtu?" << std::endl;
-                        send_message
-                        (
-                            socket,
-                            req.args["local_path"].get<std::string>(),
-                            req.args["size"].get<std::uint64_t>(),
-                            req.args["offset"].get<std::uint64_t>(),
-                            true
-                        );
+            // if (req.cmd == "UPLOAD")
+            // {
+            //     std::filesystem::path local_path = req.args["local_path"].get<std::string>();
+            //     req.args["offset"] = 0;
+            //     // req.args["offset"] = 3;
+            //     req.args["size"] = std::filesystem::file_size(local_path);
+            //     req.args["hash"] = "sha256_" + sha256_file(local_path);
+            // }
 
-                    }
-                }
-                else
-                {
-                    break;
-                }
-            }
+            // if (req.cmd == "DOWNLOAD")
+            // {
+
+            // }
+             
+
+            // if (!send_request(socket, req)) 
+            // {
+            //     std::cerr << "[error] Failed to send request\n";
+            //     spdlog::error("Failed to send request");
+            //     continue;
+            // }
+
+            // while (true)
+            // { 
+            //     resp = receive_response(socket);
+            //     if(resp.status == "OK" && resp.code == 1)
+            //     {
+            //         // std::uint64_t size = resp.data.at("size").get<std::uint64_t>();
+            //         // if (req.cmd == "LIST")
+            //         // {
+            //         //     auto msg = receive_message(socket, "", size, false);
+            //         //     if (msg) {
+            //         //         std::cout << *msg << "\n";
+            //         //     } else {
+            //         //         std::cout << "[client] no message\n";
+            //         //     }
+            //         //     continue; 
+            //         // }
+            //         if (req.cmd == "UPLOAD")
+            //         {
+            //             std::cout << "somtu?" << std::endl;
+            //             send_message
+            //             (
+            //                 socket,
+            //                 req.args["local_path"].get<std::string>(),
+            //                 req.args["size"].get<std::uint64_t>(),
+            //                 req.args["offset"].get<std::uint64_t>(),
+            //                 true
+            //             );
+
+            //         }
+            //     }
+            //     else
+            //     {
+            //         break;
+            //     }
+            // }
             
           
             // asio::write(socket, asio::buffer(message));
@@ -451,7 +671,6 @@ int main(int argc, char* argv[]) {
             // char reply[1024];
             // size_t reply_length = socket.read_some(asio::buffer(reply));
             // std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
-        }
         }
     }
     catch (std::exception& e) {

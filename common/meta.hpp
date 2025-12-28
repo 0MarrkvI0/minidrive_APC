@@ -33,7 +33,7 @@ inline void apply_filename_to_remote_path(FileTransferMeta& meta)
     std::filesystem::path remote(meta.remote_path);
     remote /= filename;
 
-    meta.remote_path = remote.string() + ".part";
+    meta.remote_path = remote.string();
 }
 
 
@@ -107,3 +107,40 @@ inline void update_meta_offset(const std::filesystem::path& meta_path,
     save_meta_atomic(meta_path, m);
 }
 
+inline nlohmann::json load_transfer_meta(const std::string& transfer_dir)
+{
+    nlohmann::json result = nlohmann::json::array();
+
+    std::error_code ec;
+    if (!std::filesystem::exists(transfer_dir, ec) || !std::filesystem::is_directory(transfer_dir, ec))
+    {
+        return result; // prázdne pole
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(transfer_dir, ec))
+    {
+        if (ec) break;
+
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".meta") continue;
+
+        try
+        {
+            std::ifstream in(entry.path());
+            if (!in) continue;
+
+            nlohmann::json j;
+            in >> j;
+
+            FileTransferMeta meta = j.get<FileTransferMeta>();
+            result.push_back(meta); // použije to_json
+        }
+        catch (...)
+        {
+            // poškodený / nečitateľný meta súbor → ignoruj
+            continue;
+        }
+    }
+
+    return result;
+}

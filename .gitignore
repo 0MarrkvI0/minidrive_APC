@@ -1,1 +1,3 @@
 build/
+test_files/
+server/storage
