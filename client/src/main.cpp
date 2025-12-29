@@ -13,7 +13,7 @@
 
 using asio::ip::tcp;
 
-const std::string TRANSFERS_PATH = "client/transfers";
+// const std::string TRANSFERS_PATH = "client/transfers";
 
 
 #include <spdlog/spdlog.h>
@@ -188,34 +188,9 @@ config set_up_config(int argc, char* argv[], config& cfg)
     return cfg;
 }
 
-void parse_command(const std::string& line, Request& req) 
+
+void check_path(Request& req)
 {
-    std::istringstream iss(line);
-
-    iss >> req.cmd;
-    if (req.cmd.empty())
-        throw std::runtime_error("Empty command");
-
-    std::vector<std::string> argument_list;
-    std::string curr_arg;
-    while (iss >> curr_arg) argument_list.push_back(curr_arg);
-
-    auto curr_cmd = CMD_LIST.find(req.cmd);
-    if (curr_cmd == CMD_LIST.end())
-        throw std::runtime_error("Unknown command: " + req.cmd);
-
-    const auto& cmd_info = curr_cmd->second;
-    if (argument_list.size() < cmd_info.min_args ||
-        argument_list.size() > cmd_info.max_args)
-        throw std::runtime_error("Invalid arg count for " + req.cmd);
-
-    req.args = nlohmann::json::object();
-
-    for (size_t i = 0; i < argument_list.size(); ++i) 
-    {
-        req.args[cmd_info.args[i]] = argument_list[i];
-    }
-
     if (req.args.contains("local_path"))
     {
         if (req.args["local_path"].is_string() == false)
@@ -245,13 +220,97 @@ void parse_command(const std::string& line, Request& req)
     }
 }
 
+void parse_command(const std::string& line, Request& req) 
+{
+    std::istringstream iss(line);
+
+    iss >> req.cmd;
+    if (req.cmd.empty())
+        throw std::runtime_error("Empty command");
+
+    std::vector<std::string> argument_list;
+    std::string curr_arg;
+    while (iss >> curr_arg) argument_list.push_back(curr_arg);
+
+    auto curr_cmd = CMD_LIST.find(req.cmd);
+    if (curr_cmd == CMD_LIST.end())
+        throw std::runtime_error("Unknown command: " + req.cmd);
+
+    const auto& cmd_info = curr_cmd->second;
+    if (argument_list.size() < cmd_info.min_args ||
+        argument_list.size() > cmd_info.max_args)
+        throw std::runtime_error("Invalid arg count for " + req.cmd);
+
+    req.args = nlohmann::json::object();
+
+    for (size_t i = 0; i < argument_list.size(); ++i) 
+    {
+        req.args[cmd_info.args[i]] = argument_list[i];
+    }
+
+    check_path(req);
+}
+
+// 0-OK 1-ERROR
+bool handle_duplicate(asio::ip::tcp::socket& socket,Request& req)
+{
+    std::cout << "Delete existing file [d] or choose other destination [c] or nothing [other keys]: ";
+
+    char choice = 0;
+    std::cin >> choice;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+    if (choice == 'd' || choice == 'D')
+    {
+        // pôvodné args 
+        // +
+        req.args["force"] = true; //mozeme zmazat subor
+        req.args["offset"] = 0;
+    }
+    else if (choice == 'c' || choice == 'C')
+    {
+        std::string new_path;
+        std::cout << "Enter new remote path: ";
+        std::getline(std::cin, new_path);
+
+        // pôvodné args 
+        // +
+        if (req.cmd == "UPLOAD")
+        {
+            req.args["local_path"] = new_path;
+        }
+        if (req.cmd == "DOWNLOAD")
+        {
+            req.args["remote_path"] = new_path;
+        }
+        check_path(req);
+        req.args["offset"] = 0;
+        }
+        else
+        {
+            std::cout << "[client] Upload cancelled by user\n";
+            return 1;
+        }
+
+        if (req.cmd == "UPLOAD")
+        {
+            if (!send_request(socket, req))
+            {
+                std::cerr << "[client] Failed to resend upload request\n";
+                return 1;
+            }
+        }
+        return 0;
+}
+
+
 void handle_upload(asio::ip::tcp::socket& socket, Request& req)
 {
     std::filesystem::path local_path = req.args["local_path"].get<std::string>();
     
     if (!req.args.contains("resume"))
     {
-        req.args["offset"] = 0; // alebo načítaj z meta ak robíš resume
+        req.args["offset"] = 0; 
         req.args["size"]   = std::filesystem::file_size(local_path);
         req.args["hash"]   = "sha256_" + sha256_file(local_path);
     }
@@ -282,6 +341,15 @@ void handle_upload(asio::ip::tcp::socket& socket, Request& req)
             if (resp.code == 0) {return;}
 
         }
+        else if (resp.status == "UPLOAD_DUPLICATE")
+        {
+            std::cout << "[client] " << resp.message << "\n";
+            if(handle_duplicate(socket,req)){return;}
+            if (req.args.contains("force"))
+            {
+                std::filesystem::remove(local_path);
+            }
+        }
         else
         {
             // ked resp.status = ERROR
@@ -295,27 +363,49 @@ void handle_upload(asio::ip::tcp::socket& socket, Request& req)
     }
 }
 
-void handle_download(asio::ip::tcp::socket& socket, Request& req)
+void handle_download(asio::ip::tcp::socket& socket, Request& req, const bool is_public)
 {
     std::filesystem::path local_path;
 
-    if (!req.args.contains("local_path"))
+    if (!req.args.contains("resume"))
     {
-        std::filesystem::path remote_path = std::filesystem::path(req.args["remote_path"].get<std::string>());
-        std::string filename = remote_path.filename().string();
-        // current directory + filename z remote_path
-        local_path = std::filesystem::current_path() / filename;
+        if (!req.args.contains("local_path"))
+        {
+            std::filesystem::path remote_path = std::filesystem::path(req.args["remote_path"].get<std::string>());
+            std::string filename = remote_path.filename().string();
+            // current directory + filename z remote_path
+            local_path = std::filesystem::current_path() / filename;
+        }
+        else
+        {
+            local_path = std::filesystem::path(req.args["local_path"].get<std::string>());
+        }
     }
     else
     {
         local_path = std::filesystem::path(req.args["local_path"].get<std::string>());
     }
-  
+
+    std::error_code ec;
+
+    //TODO: tuje ze uz existuje (download)
+    if (std::filesystem::exists(local_path, ec))
+    {
+        std::cout << "UZ existujem hah." << std::endl;
+        if (handle_duplicate(socket,req)){return;}
+        if (req.args.contains("force"))
+        {
+            std::filesystem::remove(local_path);
+        }
+    }
     
+  
     if (!send_request(socket, req)) 
     {
         throw std::runtime_error("Failed to send request");
     }
+
+    FileTransferMeta metafile;
 
     for (;;)
     {
@@ -325,14 +415,27 @@ void handle_download(asio::ip::tcp::socket& socket, Request& req)
         {
             if (resp.code == 1)
             {
-                // zaciname posielat v loope
-                send_message(
+                metafile.cmd = req.cmd;
+                // uz sme si definovali spravnu local_path (aj pre resume)
+                // je to prehodene lebo robene pre server (remote je teraz local)
+                metafile.remote_path = local_path.string();
+                // zostava remote_path lebo by sa nemala menit (inak ERROR)
+                metafile.local_path = req.args["remote_path"].get<std::string>();
+                // server nam overi / posle spravne metadata o subore
+                metafile.file_hash = resp.data["hash"].get<std::string>();
+                metafile.offset = resp.data["offset"].get<std::uint64_t>();
+                metafile.file_size = resp.data["size"].get<std::uint64_t>();
+                
+                // zaciname prijimat v loope
+                receive_message
+                (
                     socket,
-                    req.args["local_path"].get<std::string>(),
-                    req.args["size"].get<std::uint64_t>(),
-                    req.args["offset"].get<std::uint64_t>(),
+                    metafile,
+                    (std::filesystem::current_path()).string(),
+                    is_public,
                     true
-                ); 
+                );
+
             }
             // koniec success upload
             if (resp.code == 0) {return;}
@@ -485,50 +588,110 @@ int main(int argc, char* argv[]) {
                     client_config.username = req.args["username"];
                     logged_in = true;
                     spdlog::info("Logged in successfully as '{}'", client_config.username);
+                    
                     // ak su resume uploads tak nam pridu v jsone ako data["resumed_transfers"]
+                    // ak su resume downloads najdeme metafiles v pwd/transfer
+                    // pridam ich do 1 json array a sortnem podla last_update (od najstarsieho)
+
+                    nlohmann::json server_resumed = nlohmann::json::array();
+
                     if 
                     (
                         resp.data.contains("resumed_transfers") &&
-                        !resp.data["resumed_transfers"].is_null() &&
-                        !resp.data["resumed_transfers"].empty()
+                        resp.data["resumed_transfers"].is_array() &&
+                        !resp.data["resumed_transfers"].empty() 
                     )
+                    {
+                        // upload meta
+                        for (const auto& upload_meta : resp.data["resumed_transfers"])
+                        {
+                            server_resumed.push_back(upload_meta);
+                        }
+                    }
+
+                    // download meta
+                    std::filesystem::path download_path = std::filesystem::current_path() / "transfer";
+                
+                    nlohmann::json resumed_downloads = load_transfer_meta(download_path.string());
+                    for (const auto& download_meta : resumed_downloads)
+                    {
+                        server_resumed.push_back(download_meta);
+                    }
+
+                    if (server_resumed.empty()){break;}
+
+                    std::vector<nlohmann::json> vector = server_resumed.get<std::vector<nlohmann::json>>();
+
+                    // ziskame timestamp
+                    auto get_timestamp = [](const nlohmann::json& metafile) -> std::int64_t {return metafile.value("last_update", 0);};
+
+                    std::sort(vector.begin(), vector.end(), [&](const auto& a, const auto& b)
+                    {
+                        return get_timestamp(a) < get_timestamp(b); // najstrsie pojdu prve
+                    });
+
+                    // finalny list
+                    server_resumed = nlohmann::json::array();
+                    for (auto& meta : vector)
+                    {
+                        server_resumed.push_back(std::move(meta));
+                    }
+
+                    if (!server_resumed.empty())
+                
                     {
                         std::cout << "Incomplete upload/downloads detected, resume? (y/n):\n";
                         std::string ans; std::getline(std::cin, ans);
-
+ 
                         if (!ans.empty() && (ans[0] == 'y' || ans[0] == 'Y'))
                         {
-                            // postupne sa obnovia resumed uploads
-                            for (size_t i = 0; i < resp.data["resumed_transfers"].size(); ++i)
+                            // postupne sa obnovia resumed uploads/uploads
+                            for (const auto& meta : server_resumed)
                             {
-                                req.clear();                            
-                                const auto& t = resp.data["resumed_transfers"][i]; 
-
-                                // type je "UPLOAD" / "DOWNLOAD"
-                                req.cmd = t.at("type").get<std::string>();
-
-                                // args naplníme z JSONu
-                                req.args["hash"] = t.at("file_hash");
-                                req.args["size"] = t.at("file_size");
-                                req.args["offset"] = t.at("offset");
-                                req.args["remote_path"] = t.at("remote_path");
-                                req.args["local_path"] = t.at("local_path");
+                                req.clear();
+                                req.cmd = meta.at("type").get<std::string>();
+                                req.args["hash"] = meta.at("file_hash");
+                                req.args["size"] = meta.at("file_size");
+                                req.args["offset"] = meta.at("offset");
                                 req.args["resume"] = true;
 
-                                std::cout << "[resume] " << req.cmd << " from offset=" 
-                                        << req.args["offset"] << "\n";
+                                std::cout << "[resume] " << req.cmd << " from offset=" << req.args["offset"] << "\n";
 
-                                try
+                                if(req.cmd == "UPLOAD")
                                 {
-                                    handle_upload(socket,req);
+                                    req.args["remote_path"] = meta.at("remote_path");
+                                    req.args["local_path"] = meta.at("local_path");
+                                    try
+                                    {
+                                        handle_upload(socket,req);
+                                    }
+                                    catch(const std::exception& e)
+                                    {
+                                        std::cerr << "[error] " << e.what() << "\n";
+                                        spdlog::error("{}", e.what());
+                                        continue;
+                                    }
+
                                 }
-                                catch(const std::exception& e)
+                                if (req.cmd == "DOWNLOAD")
                                 {
-                                    std::cerr << "[error] " << e.what() << "\n";
-                                    spdlog::error("{}", e.what());
+                                    req.args["remote_path"] = meta.at("local_path");
+                                    req.args["local_path"] = meta.at("remote_path");
+                                    try
+                                    {
+                                        handle_download(socket,req,(client_config.username == "public"));
+                                    }
+                                    catch (const std::exception& e)
+                                    {
+                                        std::cerr << "[error] " << e.what() << "\n";
+                                        spdlog::error("{}", e.what());
+                                        continue;
+                                    }
+
                                 }
+      
                             }
-                            std::cout << resp.data["resumed_transfers"] << std::endl;
+            
                         }
                     }
                 }
@@ -551,15 +714,12 @@ int main(int argc, char* argv[]) {
             }
         }
         std::cout << "Welcome, " << client_config.username << "!\n";
-        //TODO: init transfer dir
         while (true) 
         {
             req.clear();
             std::string message;
             read_line_trim(message);
             if (message.empty()) continue;
-
-            // std::optional<std::string> src_path_opt;
             
             try 
             {
@@ -579,7 +739,7 @@ int main(int argc, char* argv[]) {
                 }
                 if (req.cmd == "DOWNLOAD")
                 {
-
+                    handle_download(socket,req,client_config.username == "public");
                 }
             }
             catch(const std::exception& e)

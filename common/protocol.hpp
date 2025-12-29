@@ -274,7 +274,7 @@ inline std::optional<std::string> receive_message
             throw std::runtime_error(ec.message());
         }
 
-        // klient poslal .part
+        // mame .part
         if (ends_with(meta.remote_path, ".part"))
         {
             if (!exists)
@@ -287,6 +287,12 @@ inline std::optional<std::string> receive_message
         //klient poslal original file bez .part
         else
         {
+            //TODO:User should either delete it, or pick a different name/path.
+            // ak file .ext uz existuje
+            if (exists)
+            {
+                throw std::runtime_error("File already exists");
+            }
             // finálny neexistuje = budeme zapisovať do .part
             // uz by bol inak zachyteny (ak by bol rovnaky)
             meta.remote_path += ".part";

@@ -439,12 +439,14 @@ int main(int argc, char* argv[])
                 // zistime ci uz existuje
                 if (std::filesystem::exists(p, ec))
                 {
-                    send_response(socket,Response{"ERROR", 500, "UPLOAD_FAILED", {"message", "File already exists."}});
+                    //TODO:: tuje ze uz exsituje (upload)
+                    send_response(socket,Response{"ERROR", 500, "UPLOAD_DUPLICATE", {"message", "File already exists."}});
                     continue;
                 }
             }
+            
             // odpoved na req
-            send_response(socket, Response{"OK", 1, "START_UPLOAD", {}});
+            send_response(socket, Response{"OK", 1, "UPLOAD_START", {}});
             try
             {
                 // prenos suboru
@@ -463,7 +465,7 @@ int main(int argc, char* argv[])
                 continue;
             }
             // ukoncenie req
-            send_response(socket, Response{"OK", 0, "END_UPLOAD", {}});
+            send_response(socket, Response{"OK", 0, "UPLOAD_END", {}});
             continue;
         }
 
@@ -471,6 +473,7 @@ int main(int argc, char* argv[])
         {
             std::filesystem::path remote_path;
             
+            // kontrola ci existuje file v server repo inak ERROR
             if (!check_path(
                 user_profile.user_directory,
                 req.args["remote_path"].get<std::string>(),
@@ -481,10 +484,21 @@ int main(int argc, char* argv[])
             }
 
             remote_path = req.args["remote_path"].get<std::string>();
-            const auto size = std::filesystem::file_size(remote_path);
-            const auto hash = "sha256_" + sha256_file(remote_path);
+            const std::uint64_t size = std::filesystem::file_size(remote_path);
+            const std::string hash = "sha256_" + sha256_file(remote_path);
+            auto offset = 0;
+
+            if (req.args.contains("resume"))
+            {
+                offset = req.args["offset"].get<std::uint64_t>();
+                if (size != req.args["size"].get<std::uint64_t>() || hash != req.args["hash"].get<std::string>())
+                {
+                    // pravdeopdobne sa zmenil obsah suboru takze treba odznova
+                    offset = 0;
+                }
+            }
             
-            send_response(socket, Response{"OK",1,"DOWNLOAD_START",{{"offset", 0},{"size", size},{"hash", hash}}});
+            send_response(socket, Response{"OK",1,"DOWNLOAD_START",{{"offset", offset},{"size", size},{"hash", hash}}});
 
             try
             {
@@ -493,14 +507,17 @@ int main(int argc, char* argv[])
                     socket,
                     req.args["remote_path"].get<std::string>(),
                     size,
-                    0, //TODO: co ak bude resume
+                    offset,
                     true
                 );
             }
             catch(std::exception& e)
             {
-
+                send_response(socket, {"ERROR",500,"DOWNLOAD_FAILED",{ {"message", e.what()} }});
+                continue;
             }
+            send_response(socket, Response{"OK", 0, "DOWNLOAD_END", {}});
+            continue;
 
         }
 
