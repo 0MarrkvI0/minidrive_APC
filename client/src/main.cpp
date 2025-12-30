@@ -15,6 +15,26 @@ using asio::ip::tcp;
 
 // const std::string TRANSFERS_PATH = "client/transfers";
 
+//TODO multithread
+
+// int main(int argc, char** argv) {
+//     config base = set_up_config(argc, argv, config{});
+
+//     int N = 5; // koľko klientov chceš
+//     std::vector<std::thread> threads;
+//     threads.reserve(N);
+
+//     for (int i = 0; i < N; i++) {
+//         config cfg = base;
+//         cfg.username = base.username + std::to_string(i);    
+//         cfg.log_file = "client_" + std::to_string(i) + ".log"; 
+
+//         threads.emplace_back([cfg, i] { run_client_instance(cfg, i); });
+//     }
+
+//     for (auto& t : threads) t.join();
+// }
+
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -203,7 +223,7 @@ void check_path(Request& req)
                 throw std::runtime_error("Local path does not exist: " + loc_path.string());
         }
 
-        if (req.cmd == "DOWNLOAD")
+        if (req.cmd == "DOWNLOAD" || req.cmd == "SYNC")
         {
             if (!std::filesystem::is_directory(loc_path))
             {
@@ -260,6 +280,7 @@ bool handle_duplicate(asio::ip::tcp::socket& socket,Request& req)
     std::cin >> choice;
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
+    // delete file
     if (choice == 'd' || choice == 'D')
     {
         // pôvodné args 
@@ -270,37 +291,31 @@ bool handle_duplicate(asio::ip::tcp::socket& socket,Request& req)
     else if (choice == 'c' || choice == 'C')
     {
         std::string new_path;
-        std::cout << "Enter new remote path: ";
+        std::cout << "Enter new local path: ";
         std::getline(std::cin, new_path);
 
         // pôvodné args 
         // +
-        if (req.cmd == "UPLOAD")
-        {
-            req.args["local_path"] = new_path;
-        }
-        if (req.cmd == "DOWNLOAD")
-        {
-            req.args["remote_path"] = new_path;
-        }
         check_path(req);
+        req.args["local_path"] = new_path;    
+        
         req.args["offset"] = 0;
-        }
-        else
+    }
+    else
+    {
+        std::cout << "[client] Upload cancelled by user\n";
+        return 1;
+    }
+
+    if (req.cmd == "UPLOAD")
+    {
+        if (!send_request(socket, req))
         {
-            std::cout << "[client] Upload cancelled by user\n";
+            std::cerr << "[client] Failed to resend upload request\n";
             return 1;
         }
-
-        if (req.cmd == "UPLOAD")
-        {
-            if (!send_request(socket, req))
-            {
-                std::cerr << "[client] Failed to resend upload request\n";
-                return 1;
-            }
-        }
-        return 0;
+    }
+    return 0;
 }
 
 
@@ -328,7 +343,7 @@ void handle_upload(asio::ip::tcp::socket& socket, Request& req)
         {
             if (resp.code == 1)
             {
-                // zaciname posielat v loope
+                // zaciname posielat v loope (bytestream)
                 send_message(
                     socket,
                     req.args["local_path"].get<std::string>(),
@@ -341,14 +356,11 @@ void handle_upload(asio::ip::tcp::socket& socket, Request& req)
             if (resp.code == 0) {return;}
 
         }
-        else if (resp.status == "UPLOAD_DUPLICATE")
+        // ak subor uz je vytvoreny
+        else if (resp.message == "UPLOAD_DUPLICATE")
         {
             std::cout << "[client] " << resp.message << "\n";
             if(handle_duplicate(socket,req)){return;}
-            if (req.args.contains("force"))
-            {
-                std::filesystem::remove(local_path);
-            }
         }
         else
         {
@@ -366,38 +378,43 @@ void handle_upload(asio::ip::tcp::socket& socket, Request& req)
 void handle_download(asio::ip::tcp::socket& socket, Request& req, const bool is_public)
 {
     std::filesystem::path local_path;
+    std::filesystem::path remote_path = std::filesystem::path(req.args["remote_path"].get<std::string>());
+    std::string filename = remote_path.filename().string();
 
     if (!req.args.contains("resume"))
     {
         if (!req.args.contains("local_path"))
         {
-            std::filesystem::path remote_path = std::filesystem::path(req.args["remote_path"].get<std::string>());
-            std::string filename = remote_path.filename().string();
             // current directory + filename z remote_path
             local_path = std::filesystem::current_path() / filename;
         }
         else
         {
-            local_path = std::filesystem::path(req.args["local_path"].get<std::string>());
+            local_path = std::filesystem::path(req.args["local_path"].get<std::string>()) / filename;
         }
     }
     else
     {
-        local_path = std::filesystem::path(req.args["local_path"].get<std::string>());
+        local_path = std::filesystem::path(req.args["local_path"].get<std::string>()) / filename;
     }
 
     std::error_code ec;
 
-    //TODO: tuje ze uz existuje (download)
     if (std::filesystem::exists(local_path, ec))
     {
-        std::cout << "UZ existujem hah." << std::endl;
+
         if (handle_duplicate(socket,req)){return;}
         if (req.args.contains("force"))
         {
-            std::filesystem::remove(local_path);
+            std::filesystem::remove(local_path,ec);
+            if(ec){throw std::runtime_error("Cannot delete file");}
         }
+        else
+        {
+            local_path = std::filesystem::path(req.args["local_path"].get<std::string>()) / filename;
+        }     
     }
+    if(ec){throw std::runtime_error("Cannot access file");}
     
   
     if (!send_request(socket, req)) 
@@ -453,6 +470,85 @@ void handle_download(asio::ip::tcp::socket& socket, Request& req, const bool is_
         }
     }
 }
+
+void handle_sync(asio::ip::tcp::socket& socket, Request& req)
+{
+    std::filesystem::path local_path = req.args["local_path"].get<std::string>();
+    std::filesystem::path remote_path = req.args["remote_path"].get<std::string>();
+
+    req.args["files"] = build_directory_file_list_recursive(local_path);
+
+    if(req.args["files"].empty())
+    {
+        std::cout << "No files in dir: " << local_path << "/n";
+        return;
+    }
+
+    if (!send_request(socket, req)) 
+    {
+        std::cerr << "[error] Failed to send SYNC request\n";
+        spdlog::error("Failed to send SYNC request");
+        return;
+    }
+    while(1)
+    {
+        Response resp = receive_response(socket);
+        if (resp.message == "SYNC_START")
+        {
+            
+            // if (!resp.data.contains("files"))
+            // {
+            //     return;
+            // }
+            
+           const auto uploads = resp.data.at(1);   
+
+            for (const auto& file : uploads)
+            {
+                req.clear();
+                req.cmd = "UPLOAD";
+                req.args["local_path"]  = file["local_path"].get<std::string>();
+
+                // remote_path je optional
+                if (file.contains("remote_path"))
+                {
+                    req.args["remote_path"] = file["remote_path"].get<std::string>();
+                }
+                else
+                {
+                    req.args["remote_path"] = remote_path;    
+                }
+                
+                try
+                {
+                    handle_upload(socket,req);
+                }
+                catch(const std::exception& e)
+                {
+                    std::cerr << "[client] Exception: " << e.what() << "\n";
+                    continue;
+                }
+            }
+            continue;   
+        }
+        if (resp.message == "SYNC_END")
+        {
+            std::cout << resp.data.at(1).dump(2) << "\n";
+            return; 
+        }
+        else
+        {
+            // ked resp.status = ERROR
+            std::string err =
+                "Server error: " + resp.status +
+                " "+ std::to_string(resp.code) +
+                " " + resp.message +
+                " " + resp.data.dump();
+            throw std::runtime_error(err);
+        }
+    }
+}
+
 
 
 int main(int argc, char* argv[]) {
@@ -736,10 +832,17 @@ int main(int argc, char* argv[]) {
                 if (req.cmd == "UPLOAD")
                 {
                     handle_upload(socket,req);
+                    continue;
                 }
                 if (req.cmd == "DOWNLOAD")
                 {
                     handle_download(socket,req,client_config.username == "public");
+                    continue;
+                }
+                if (req.cmd == "SYNC")
+                {
+                    handle_sync(socket,req);
+                    continue;
                 }
             }
             catch(const std::exception& e)

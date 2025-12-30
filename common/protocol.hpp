@@ -11,15 +11,13 @@
 #include <cstdint>
 #include <stdexcept>
 #include <openssl/evp.h>
-#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
-#include <stdexcept>
+#include <system_error>
 
 
 #include "meta.hpp"
-
 
 inline std::string sha256_file(const std::filesystem::path& path)
 {
@@ -205,8 +203,6 @@ inline void send_message
         }
     }
 }
-
-
 
 inline std::filesystem::path get_meta_file_path(
     const FileTransferMeta& meta,
@@ -439,64 +435,147 @@ inline std::optional<std::string> receive_message
 }
 
 
-
-
-
-
-
-
-inline std::optional<std::filesystem::path>find_meta_by_hash
-(
-    const std::filesystem::path& root,
-    const std::string& hash
-)
+// rekurzivne vrati subori v priecinku v jsone
+inline nlohmann::json build_directory_file_list_recursive(const std::filesystem::path& dir = std::filesystem::current_path())
 {
-    const std::string meta_name = hash + ".meta";
+    nlohmann::json files = nlohmann::json::array();
 
-    for (const auto& entry :
-         std::filesystem::recursive_directory_iterator(root))
+    std::error_code ec;
+    std::filesystem::path root = std::filesystem::weakly_canonical(dir, ec);
+
+    for (std::filesystem::recursive_directory_iterator i(root, ec), end; i != end && !ec; i.increment(ec))
     {
-        if (!entry.is_regular_file())
-            continue;
+        if (ec) break;
+        if (!i->is_regular_file(ec) || ec) continue;
 
-        if (entry.path().filename() == meta_name)
-            return entry.path();
+        const std::filesystem::path abs_path = i->path();
+
+        // relatívna cesta voči root (dir)
+        std::filesystem::path rel = std::filesystem::relative(abs_path, root, ec);
+        if (ec) { ec.clear(); continue; }
+
+        // kazdy file ulozime do jsonu
+        nlohmann::json f;
+        f["local_path"] = rel.generic_string();            // napr. "subdir/file.txt"
+        f["size"] = std::filesystem::file_size(abs_path, ec);
+        if (ec) { ec.clear(); continue; }
+        f["hash"] = "sha256_" + sha256_file(abs_path);
+        // absolutna cesta aby sme mohli rychlo mat remote/loacal_path
+        f["abs_path"] = abs_path.string();
+
+        files.push_back(std::move(f));
     }
-
-    return std::nullopt;
+    // vratime json arrays
+    return files;
 }
 
+#include <unordered_map>
 
-// inline nlohmann::json get_file_info
-// (
-//     const std::filesystem::path& filepath,
-//     const std::filesystem::path& root // aby som vedel kde hladat meta
-// )
-// {
-//     const std::uint64_t size = std::filesystem::file_size(filepath);
-//     const std::string hash = "sha256_" + sha256_file(filepath);
-//     std::uint64_t offset = 0;
+// struktura na ukladanie suborov v repo (vyuzitie pri SYNC)
+struct repo_item {
+    std::string rel_path;
+    std::uint64_t size = 0;
+    std::string hash;
+    std::string abs_path;
+};
 
-//     if (auto meta_path = find_meta_by_hash(root, hash))
-//     {
-//         try
-//         {
-//             md::FileTransferMeta f = md::load_meta(*meta_path);
-//             offset = f.offset;
-//         }
-//         catch (const std::exception&)
-//         {
-//             offset = 0;
-//         }
-//     }
+// ulozenie jsonov do unorderedmapy pre lahsie hladanie - O(1)
+inline std::unordered_map<std::string, repo_item>repo_items_to_map(const nlohmann::json& repo)
+{
+    std::unordered_map<std::string, repo_item> map;
+    if (!repo.is_array()) return map;
 
-//     if (offset > size)
-//         throw std::runtime_error("Offset larger than file size");
+    map.reserve(repo.size());
+    for (const auto& i : repo)
+    {
+        repo_item item;
+        item.rel_path = i.at("local_path").get<std::string>();
+        if (i.contains("size")) item.size = i.at("size").get<std::uint64_t>();
+        if (i.contains("hash")) item.hash = i.at("hash").get<std::string>();
+        if (i.contains("abs_path")) item.abs_path = i.at("abs_path").get<std::string>();
 
-//     nlohmann::json j;
-//     j["size"] = size;
-//     j["hash"] = hash;
-//     j["offset"] = offset;
+        if (!item.rel_path.empty())
+        {
+            map.emplace(item.rel_path, std::move(item));
+        }
+    }
+    return map;
+}
 
-//     return j;
-// }
+inline nlohmann::json compare_repos
+(
+    const nlohmann::json& server_repo,
+    const nlohmann::json& client_repo
+)
+{
+    // pre rychle hladanie
+    auto server = repo_items_to_map(server_repo);
+    auto client = repo_items_to_map(client_repo);
+
+    nlohmann::json out;
+    out["upload"] = nlohmann::json::array();
+    out["skip"] = nlohmann::json::array();
+    out["delete"] = nlohmann::json::array();
+
+    // klientove subory hladame na serveri
+    // kluc: rel_path 
+    // hodnota : ostatne z repo_item (size,hash,abs_path)
+    for (const auto& [c_path, c_file_info] : client)
+    {
+        auto s_file = server.find(c_path);
+
+        if (s_file == server.end())
+        {
+        std::cout << c_file_info.abs_path << " nie je na serveri\n";
+
+            // nie je na serveri (UPLOAD)
+            out["upload"].push_back({
+                {"local_path", c_file_info.abs_path}
+            });
+            continue;
+        }
+
+        // ak sme nasli pozrieme sa na info v struct
+        const auto& s_info = s_file->second;
+
+        // porovname hash a size oboch suborov
+        if (!c_file_info.hash.empty() && !s_info.hash.empty() && c_file_info.hash == s_info.hash)
+        {
+            std::cout << c_file_info.abs_path << " skip /n";
+            // ak sa zhoduju mozeme skip
+            out["skip"].push_back({{"local_path", c_file_info.abs_path}});
+        }
+        else
+        {
+            std::cout << c_file_info.abs_path << " zmenene " << s_info.abs_path << " nie je na serveri /n";
+            // ak zmenene tak si ulozime paths pre UPLOAD
+            out["upload"].push_back({
+                {"local_path", c_file_info.abs_path},
+                {"remote_path",s_info.abs_path}
+            });
+        }
+    }
+
+    // delete ak je iba na serveri
+    for (const auto& [s_path, s_file_info] : server)
+    {
+        if (client.find(s_path) == client.end())
+        {
+
+            std::cout << s_file_info.abs_path << " delete na serveri /n";
+            out["delete"].push_back({
+                {"remote_path", s_file_info.abs_path}
+            });
+        }
+    }
+
+    // spocitame pre celkove vysledky
+    out["counts"] = {
+        {"upload", out["upload"].size()},
+        {"skip",   out["skip"].size()},
+        {"delete", out["delete"].size()}
+    };
+
+    return out;
+}
+
