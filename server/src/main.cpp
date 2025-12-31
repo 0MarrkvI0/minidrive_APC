@@ -417,527 +417,528 @@ int main(int argc, char* argv[])
         std::cout << "[server] Running on port " << server_config.port << "\n";
         std::cout << "[server] Root directory: " << server_config.root_dir<< "\n";
 
-        asio::ip::tcp::socket socket(io);
-
         try 
         {
-            std::cout << "[server] Waiting for client...\n";
-            acceptor.accept(socket);
-
-            std::cout << "[server] Client connected: " << socket.remote_endpoint() << "\n";
-            
             while (true) 
             {
-                try
-                {
-                    std::cout << "ALOHA" << std::endl;
-                    Request req = receive_request(socket);
+                asio::ip::tcp::socket socket(io);
+                std::cout << "[server] Waiting for client...\n";
+                acceptor.accept(socket);
+
+                std::cout << "[server] Client connected: " << socket.remote_endpoint() << "\n";
                 
-
-                    if (req.cmd == "AUTH") 
+                while (true) 
+                {
+                    try
                     {
-                        std::string username = req.args.value("username", "");
-                        if (username == "public") 
-                        {
-                            send_response(socket, {"OK", 0, "PUBLIC_USER", {}});
-                            user_profile.username = "public";
-                            user_profile.user_directory = server_config.root_dir + "/public";
-                            user_profile.working_directory = user_profile.user_directory;
-                            if (!std::filesystem::exists(user_profile.user_directory)) 
-                            {
-                                std::filesystem::create_directories(user_profile.user_directory);     
-                            }
-                            continue;
-                        }
-                        
-                        user = find_user(user_db, username);
-
-                        if (user != std::nullopt) {
-                            // need password verification
-                            Response resp{"OK", 0, "USER_EXISTS", {}};
-                            send_response(socket, resp);
-                        } else {
-                            // register error response
-                            Response resp{"ERROR", 1001, "USER_NOT_FOUND", {}};
-                            send_response(socket, resp);
-                        }
-                    }
-
-                    if (req.cmd == "REGS") 
-                    {
-
-                        std::string username = req.args.value("username", "");
-                        std::string password = req.args.value("password", "");
-
-                        if (password.empty()) {
-                            send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
-                            continue;
-                        }
-
-                        user = find_user(user_db, username);
-                        if (user != std::nullopt) {
-                            send_response(socket, {"ERROR", 1002, "USERNAME_TAKEN", {}});
-                            continue;
-                        }
-
-                        // Create sodium password hash (includes its own salt internally)
-                        char hash_str[crypto_pwhash_STRBYTES];
-
-                        if (crypto_pwhash_str(
-                                hash_str,
-                                password.c_str(),
-                                password.size(),
-                                crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                                crypto_pwhash_MEMLIMIT_INTERACTIVE
-                            ) != 0)
-                        {
-                            send_response(socket, {"ERROR", 401, "HASHING_FAILED", {}});
-                            continue;
-                        }
-
-                        // Store user in DB
-                        nlohmann::json new_user = 
-                        {
-                            {"username", username},
-                            {"password_hash", hash_str}   // store hash as string with salt
-                        };
-
-                        user_db["users"].push_back(new_user);
-
-                        // Save DB
-                        save_user_db(user_db, server_config.root_dir);
-
-                        // Create user's private directory
-                        std::string user_dir = server_config.root_dir + "/" + username;
-                        std::filesystem::create_directory(user_dir);
-
-                        // Respond to client
-                        send_response(socket, {"OK", 0, "USER_REGISTERED", {}});
-                        user_profile.username = username;
-                        user_profile.user_directory = user_dir;
-
-                        continue;
-                    }
-
-                    if (req.cmd == "LOGN") 
-                    {
-                        std::string username = req.args.value("username", "");
-                        std::string password = req.args.value("password", "");
-
-                        if (password.empty()) {
-                            send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
-                            continue;
-                        }
-
-                        user = find_user(user_db, username);
-                        if (user == std::nullopt) {
-                            send_response(socket, {"ERROR", 1001, "USER_NOT_FOUND", {}});
-                            continue;
-                        }
-
-                        // nlohmann::json user = *user_opt;
-                        std::string stored_hash = (*user).value("password_hash", "");
-                        if (stored_hash.empty()) {
-                            send_response(socket, {"ERROR", 401, "NO_PASSWORD_HASH", {}});
-                            continue;
-                        }
-
-                        // Verify password
-                        if (crypto_pwhash_str_verify(
-                                stored_hash.c_str(),
-                                password.c_str(),
-                                password.size()
-                            ) != 0)
-                        {
-                            send_response(socket, {"ERROR", 1003, "INVALID_PASSWORD", {}});
-                            continue;
-                        }
-
-                        // Successful login
-                        std::cout << "Successful login for user: " << username << "\n";
-                        user_profile.username = username;
-                        user_profile.user_directory = server_config.root_dir + "/" + username;
-                        user_profile.working_directory = user_profile.user_directory;
-
-                        std::filesystem::path transfer_dir = user_profile.user_directory;
-                        transfer_dir /= "transfer";
-                        send_response(socket,{"OK",0,"LOGIN_SUCCESSFUL",{{"resumed_transfers", load_transfer_meta(transfer_dir.string())}}});
-                        continue;
-                    }
-
-                    if (req.cmd == "LIST")
-                    {
-                        std::filesystem::path remote_path;
-
-                        // ak mame argument path
-                        if (req.args.contains("path"))
-                        {
-                            std::optional<std::filesystem::path> remote_path_r = 
-                                check_path(user_profile.user_directory,user_profile.working_directory,req.args["path"].get<std::string>(),"dir",socket);
-                            if(!remote_path_r.has_value()){continue;} 
-                            remote_path = remote_path_r.value(); 
-                        }
-                        else
-                        {
-                            // ak nie je path tak je current user dir na serveri
-                            remote_path = user_profile.working_directory;
-                        }
-
-                        // rekurentne prehladame remote_path a ukladame do stringu msg
-                        std::string msg;
-                        for (const auto& entry : std::filesystem::recursive_directory_iterator(remote_path))
-                        {
-                            std::filesystem::path rel =
-                                std::filesystem::relative(entry.path(), remote_path);
-
-                            msg += rel.string();
-                            if (entry.is_directory()) msg += "/";
-                            msg += "\n";
-                        }
-
-                        //zisakme velkost listu
-                        std::uint64_t size = msg.size();
-                        // ak je prazdny
-                        if (msg.empty())
-                        {
-                            size = 0;
-                        }
-                        send_response(socket, Response{"OK", 1, "START_LIST", {{"size", size}}});
-                        //zacneme posielat v chunkoch
-                        if(!size == 0){send_message(socket, msg, size,0,false);}
-                        send_response(socket, Response{"OK", 0, "END_LIST", {}});
-                    }
-
-                    if (req.cmd == "UPLOAD")
-                    {
-                        handle_upload(socket,req,user_profile);
-                        continue;
-                    }
-
-                    if (req.cmd == "DOWNLOAD")
-                    {
-                        std::filesystem::path remote_path;
-                        
-                        // kontrola ci existuje file v server repo inak ERROR
-                        std::optional<std::filesystem::path> remote_path_r = 
-                            check_path
-                            (
-                                user_profile.user_directory,
-                                user_profile.user_directory,
-                                req.args["remote_path"].get<std::string>(),
-                                "file",
-                                socket
-                            );
-                        if(!remote_path_r.has_value()){continue;} 
-                        remote_path = remote_path_r.value(); 
-
-                        const std::uint64_t size = std::filesystem::file_size(remote_path);
-                        const std::string hash = "sha256_" + sha256_file(remote_path);
-                        std::uint64_t offset = 0;
-
-                        if (req.args.contains("resume"))
-                        {
-                            offset = req.args["offset"].get<std::uint64_t>();
-                            if (size != req.args["size"].get<std::uint64_t>() || hash != req.args["hash"].get<std::string>())
-                            {
-                                // pravdeopdobne sa zmenil obsah suboru takze treba odznova
-                                offset = 0;
-                            }
-                        }
-                        
-                        send_response(socket, Response{"OK",1,"DOWNLOAD_START",{{"offset", offset},{"size", size},{"hash", hash}}});
-
-                        try
-                        {
-                            send_message
-                            (
-                                socket,
-                                remote_path.string(),
-                                size,
-                                offset,
-                                true
-                            );
-                        }
-                        catch(std::exception& e)
-                        {
-                            send_response(socket, {"ERROR",500,"DOWNLOAD_FAILED",{ {"message", e.what()} }});
-                            continue;
-                        }
-                        send_response(socket, Response{"OK", 0, "DOWNLOAD_END", {}});
-                        continue;
-
-                    }
+                        std::cout << "ALOHA" << std::endl;
+                        Request req = receive_request(socket);
                     
-                    if (req.cmd == "SYNC")
-                    {
-                        //zistime ci existuje dir na serveri, automaticky odosle ERRORS
-                        std::optional<std::filesystem::path> remote_path_r = 
+
+                        if (req.cmd == "AUTH") 
+                        {
+                            std::string username = req.args.value("username", "");
+                            if (username == "public") 
+                            {
+                                send_response(socket, {"OK", 0, "PUBLIC_USER", {}});
+                                user_profile.username = "public";
+                                user_profile.user_directory = server_config.root_dir + "/public";
+                                user_profile.working_directory = user_profile.user_directory;
+                                if (!std::filesystem::exists(user_profile.user_directory)) 
+                                {
+                                    std::filesystem::create_directories(user_profile.user_directory);     
+                                }
+                                continue;
+                            }
+                            
+                            user = find_user(user_db, username);
+
+                            if (user != std::nullopt) {
+                                // need password verification
+                                Response resp{"OK", 0, "USER_EXISTS", {}};
+                                send_response(socket, resp);
+                            } else {
+                                // register error response
+                                Response resp{"ERROR", 1001, "USER_NOT_FOUND", {}};
+                                send_response(socket, resp);
+                            }
+                        }
+
+                        if (req.cmd == "REGS") 
+                        {
+
+                            std::string username = req.args.value("username", "");
+                            std::string password = req.args.value("password", "");
+
+                            if (password.empty()) {
+                                send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
+                                continue;
+                            }
+
+                            user = find_user(user_db, username);
+                            if (user != std::nullopt) {
+                                send_response(socket, {"ERROR", 1002, "USERNAME_TAKEN", {}});
+                                continue;
+                            }
+
+                            // Create sodium password hash (includes its own salt internally)
+                            char hash_str[crypto_pwhash_STRBYTES];
+
+                            if (crypto_pwhash_str(
+                                    hash_str,
+                                    password.c_str(),
+                                    password.size(),
+                                    crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                                    crypto_pwhash_MEMLIMIT_INTERACTIVE
+                                ) != 0)
+                            {
+                                send_response(socket, {"ERROR", 401, "HASHING_FAILED", {}});
+                                continue;
+                            }
+
+                            // Store user in DB
+                            nlohmann::json new_user = 
+                            {
+                                {"username", username},
+                                {"password_hash", hash_str}   // store hash as string with salt
+                            };
+
+                            user_db["users"].push_back(new_user);
+
+                            // Save DB
+                            save_user_db(user_db, server_config.root_dir);
+
+                            // Create user's private directory
+                            std::string user_dir = server_config.root_dir + "/" + username;
+                            std::filesystem::create_directory(user_dir);
+
+                            // Respond to client
+                            send_response(socket, {"OK", 0, "USER_REGISTERED", {}});
+                            user_profile.username = username;
+                            user_profile.user_directory = user_dir;
+
+                            continue;
+                        }
+
+                        if (req.cmd == "LOGN") 
+                        {
+                            std::string username = req.args.value("username", "");
+                            std::string password = req.args.value("password", "");
+
+                            if (password.empty()) {
+                                send_response(socket, {"ERROR", 400, "MISSING_FIELDS", {}});
+                                continue;
+                            }
+
+                            user = find_user(user_db, username);
+                            if (user == std::nullopt) {
+                                send_response(socket, {"ERROR", 1001, "USER_NOT_FOUND", {}});
+                                continue;
+                            }
+
+                            // nlohmann::json user = *user_opt;
+                            std::string stored_hash = (*user).value("password_hash", "");
+                            if (stored_hash.empty()) {
+                                send_response(socket, {"ERROR", 401, "NO_PASSWORD_HASH", {}});
+                                continue;
+                            }
+
+                            // Verify password
+                            if (crypto_pwhash_str_verify(
+                                    stored_hash.c_str(),
+                                    password.c_str(),
+                                    password.size()
+                                ) != 0)
+                            {
+                                send_response(socket, {"ERROR", 1003, "INVALID_PASSWORD", {}});
+                                continue;
+                            }
+
+                            // Successful login
+                            std::cout << "Successful login for user: " << username << "\n";
+                            user_profile.username = username;
+                            user_profile.user_directory = server_config.root_dir + "/" + username;
+                            user_profile.working_directory = user_profile.user_directory;
+
+                            std::filesystem::path transfer_dir = user_profile.user_directory;
+                            transfer_dir /= "transfer";
+                            send_response(socket,{"OK",0,"LOGIN_SUCCESSFUL",{{"resumed_transfers", load_transfer_meta(transfer_dir.string())}}});
+                            continue;
+                        }
+
+                        if (req.cmd == "LIST")
+                        {
+                            std::filesystem::path remote_path;
+
+                            // ak mame argument path
+                            if (req.args.contains("path"))
+                            {
+                                std::optional<std::filesystem::path> remote_path_r = 
+                                    check_path(user_profile.user_directory,user_profile.working_directory,req.args["path"].get<std::string>(),"dir",socket);
+                                if(!remote_path_r.has_value()){continue;} 
+                                remote_path = remote_path_r.value(); 
+                            }
+                            else
+                            {
+                                // ak nie je path tak je current user dir na serveri
+                                remote_path = user_profile.working_directory;
+                            }
+
+                            // rekurentne prehladame remote_path a ukladame do stringu msg
+                            std::string msg;
+                            for (const auto& entry : std::filesystem::recursive_directory_iterator(remote_path))
+                            {
+                                std::filesystem::path rel =
+                                    std::filesystem::relative(entry.path(), remote_path);
+
+                                msg += rel.string();
+                                if (entry.is_directory()) msg += "/";
+                                msg += "\n";
+                            }
+
+                            //zisakme velkost listu
+                            std::uint64_t size = msg.size();
+                            // ak je prazdny
+                            if (msg.empty())
+                            {
+                                size = 0;
+                            }
+                            send_response(socket, Response{"OK", 1, "START_LIST", {{"size", size}}});
+                            //zacneme posielat v chunkoch
+                            if(!size == 0){send_message(socket, msg, size,0,false);}
+                            send_response(socket, Response{"OK", 0, "END_LIST", {}});
+                        }
+
+                        if (req.cmd == "UPLOAD")
+                        {
+                            handle_upload(socket,req,user_profile);
+                            continue;
+                        }
+
+                        if (req.cmd == "DOWNLOAD")
+                        {
+                            std::filesystem::path remote_path;
+                            
+                            // kontrola ci existuje file v server repo inak ERROR
+                            std::optional<std::filesystem::path> remote_path_r = 
                                 check_path
                                 (
                                     user_profile.user_directory,
                                     user_profile.user_directory,
                                     req.args["remote_path"].get<std::string>(),
-                                    "dir",
+                                    "file",
                                     socket
                                 );
-                        if(!remote_path_r.has_value()){continue;} 
-                        std::filesystem::path remote_path = remote_path_r.value(); 
+                            if(!remote_path_r.has_value()){continue;} 
+                            remote_path = remote_path_r.value(); 
 
-                        // ziskame json s vsetkymi info
-                        // skip (netreba nic)
-                        // delete (remote_path - server)
-                        // upload (local_path - klient, remote_path - server)
-                        // counts (pocty jednotlivych suborov upload,skip,delete)
-                        //TODO ak pojde treba aj ked neni remote teda asi nie
-                        nlohmann::json compared = compare_repos
-                        (
-                            build_directory_file_list_recursive(remote_path),
-                            req.args["files"],
-                            req.args["remote_path"].get<std::string>(),
-                            req.args["local_path"].get<std::string>()
-                        );
+                            const std::uint64_t size = std::filesystem::file_size(remote_path);
+                            const std::string hash = "sha256_" + sha256_file(remote_path);
+                            std::uint64_t offset = 0;
 
-                        // vymazeme subory na servery ktore neboli v lokalnom repo klienta
-                        for (const auto& item : compared["delete"])
-                        {
-                            const std::string remote_path = item["remote_path"].get<std::string>();
+                            if (req.args.contains("resume"))
+                            {
+                                offset = req.args["offset"].get<std::uint64_t>();
+                                if (size != req.args["size"].get<std::uint64_t>() || hash != req.args["hash"].get<std::string>())
+                                {
+                                    // pravdeopdobne sa zmenil obsah suboru takze treba odznova
+                                    offset = 0;
+                                }
+                            }
+                            
+                            send_response(socket, Response{"OK",1,"DOWNLOAD_START",{{"offset", offset},{"size", size},{"hash", hash}}});
+
                             try
                             {
-                                delete_server_file(socket, remote_path, true);
+                                send_message
+                                (
+                                    socket,
+                                    remote_path.string(),
+                                    size,
+                                    offset,
+                                    true
+                                );
                             }
-                            catch (...)
+                            catch(std::exception& e)
                             {
-                                // v pripade ze nastane error pri delete urobime skip
-                                compared["counts"]["skip"] = compared["counts"]["skip"].get<uint64_t>() + 1;
-                                compared["counts"]["delete"] = compared["counts"]["delete"].get<uint64_t>() - 1;
+                                send_response(socket, {"ERROR",500,"DOWNLOAD_FAILED",{ {"message", e.what()} }});
+                                continue;
                             }
-                        }
+                            send_response(socket, Response{"OK", 0, "DOWNLOAD_END", {}});
+                            continue;
 
-                        // ak mame files na upload
-                        if (compared["counts"]["upload"].get<std::uint64_t>() != 0)
+                        }
+                        
+                        if (req.cmd == "SYNC")
                         {
-                            std::uint64_t successful_uploads = 0;
-                            // inicializacia SYNC 
-                            send_response(socket, Response{"OK", 1, "SYNC_START", {"files", compared["upload"]}});
-                            for (const auto& item : compared["upload"])
+                            //zistime ci existuje dir na serveri, automaticky odosle ERRORS
+                            std::optional<std::filesystem::path> remote_path_r = 
+                                    check_path
+                                    (
+                                        user_profile.user_directory,
+                                        user_profile.user_directory,
+                                        req.args["remote_path"].get<std::string>(),
+                                        "dir",
+                                        socket
+                                    );
+                            if(!remote_path_r.has_value()){continue;} 
+                            std::filesystem::path remote_path = remote_path_r.value(); 
+
+                            // ziskame json s vsetkymi info
+                            // skip (netreba nic)
+                            // delete (remote_path - server)
+                            // upload (local_path - klient, remote_path - server)
+                            // counts (pocty jednotlivych suborov upload,skip,delete)
+                            //TODO ak pojde treba aj ked neni remote teda asi nie
+                            nlohmann::json compared = compare_repos
+                            (
+                                build_directory_file_list_recursive(remote_path),
+                                req.args["files"],
+                                req.args["remote_path"].get<std::string>(),
+                                req.args["local_path"].get<std::string>()
+                            );
+
+                            // vymazeme subory na servery ktore neboli v lokalnom repo klienta
+                            for (const auto& item : compared["delete"])
                             {
-                                // cakame na UPLOAD cmd
-                                req = receive_request(socket);
-                                // ak je ERROR tak sa spracuje automaticky a vrati 1
-                                if(!handle_upload(socket,req,user_profile))
+                                const std::string remote_path = item["remote_path"].get<std::string>();
+                                try
                                 {
-                                    successful_uploads++;
+                                    delete_server_file(socket, remote_path, true);
+                                }
+                                catch (...)
+                                {
+                                    // v pripade ze nastane error pri delete urobime skip
+                                    compared["counts"]["skip"] = compared["counts"]["skip"].get<uint64_t>() + 1;
+                                    compared["counts"]["delete"] = compared["counts"]["delete"].get<uint64_t>() - 1;
                                 }
                             }
-                            std::cout <<"sc:" << successful_uploads << "/n";
-                            const auto failed_uploads = compared["counts"]["upload"].get<std::uint64_t>() - successful_uploads;
 
-                            // ak sme mali neuspesne uploady budu skip
-                            if (failed_uploads != 0)
+                            // ak mame files na upload
+                            if (compared["counts"]["upload"].get<std::uint64_t>() != 0)
                             {
-                                compared["counts"]["skip"] = compared["counts"]["skip"].get<std::uint64_t>() + failed_uploads;
-                                compared["counts"]["upload"] = compared["counts"]["upload"].get<std::uint64_t>() - failed_uploads;
+                                std::uint64_t successful_uploads = 0;
+                                // inicializacia SYNC 
+                                send_response(socket, Response{"OK", 1, "SYNC_START", {"files", compared["upload"]}});
+                                for (const auto& item : compared["upload"])
+                                {
+                                    // cakame na UPLOAD cmd
+                                    req = receive_request(socket);
+                                    // ak je ERROR tak sa spracuje automaticky a vrati 1
+                                    if(!handle_upload(socket,req,user_profile))
+                                    {
+                                        successful_uploads++;
+                                    }
+                                }
+                                std::cout <<"sc:" << successful_uploads << "/n";
+                                const auto failed_uploads = compared["counts"]["upload"].get<std::uint64_t>() - successful_uploads;
+
+                                // ak sme mali neuspesne uploady budu skip
+                                if (failed_uploads != 0)
+                                {
+                                    compared["counts"]["skip"] = compared["counts"]["skip"].get<std::uint64_t>() + failed_uploads;
+                                    compared["counts"]["upload"] = compared["counts"]["upload"].get<std::uint64_t>() - failed_uploads;
+                                }
                             }
+
+                            // uspesny sync (posielame aj vykonane zmeny)
+                            send_response(socket, Response{"OK", 0, "SYNC_END", {"status", compared["counts"]}}); 
                         }
 
-                        // uspesny sync (posielame aj vykonane zmeny)
-                        send_response(socket, Response{"OK", 0, "SYNC_END", {"status", compared["counts"]}}); 
-                    }
-
-                    if (req.cmd == "DELETE")
-                    {
-                        // ziskame remote_path od klienta
-                        std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
-
-                        std::string format = "file";
-                        if (!remote_path.has_extension())
+                        if (req.cmd == "DELETE")
                         {
-                            format = "dir";
+                            // ziskame remote_path od klienta
+                            std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
+
+                            std::string format = "file";
+                            if (!remote_path.has_extension())
+                            {
+                                format = "dir";
+                            }
+
+                            std::optional<std::filesystem::path> remote_path_r = 
+                                check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),format,socket);
+
+                            if (!remote_path_r.has_value()) {continue;}
+                            remote_path = remote_path_r.value();
+                        
+                            try
+                            {
+                                // odstranime folder alebo file
+                                delete_server_file(socket,remote_path.string(),!std::filesystem::is_directory(remote_path));
+                            }
+                            catch (std::exception& e)
+                            {
+                                send_response(socket, Response{"ERROR", 0, "DELETE_FAILED", {"message", e.what()}}); 
+                                continue;
+                            }
+                            send_response(socket, Response{"OK", 0, "DELETE_SUCCESS", {}}); 
+                            continue;
                         }
-
-                        std::optional<std::filesystem::path> remote_path_r = 
-                            check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),format,socket);
-
-                        if (!remote_path_r.has_value()) {continue;}
-                        remote_path = remote_path_r.value();
                     
-                        try
+                        if (req.cmd == "EXIT")
                         {
-                            // odstranime folder alebo file
-                            delete_server_file(socket,remote_path.string(),!std::filesystem::is_directory(remote_path));
+                            //opdoved na EXIT a vypnutie
+                            send_response(socket, Response{"OK", 0, "GOODBYE", {}});
+                            std::cout << "[server] Client disconnected.\n";
+                            // zakazmeme dalsie zapisy a citania
+                            // socket.shutdown(asio::ip::tcp::socket::shutdown_both);
+                            break;
                         }
-                        catch (std::exception& e)
+                    
+                        if (req.cmd == "CD")
                         {
-                            send_response(socket, Response{"ERROR", 0, "DELETE_FAILED", {"message", e.what()}}); 
+                            std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
+                            // skontrolujeme ci je validny dir (automaticky posle ERRORS)
+                            std::optional<std::filesystem::path> remote_path_r = 
+                                check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),"dir",socket);
+                            if (!remote_path_r.has_value()) {continue;}
+                            remote_path = remote_path_r.value();
+                            // nastavime novy work dir
+                            user_profile.working_directory = remote_path.string();
+                            send_response(socket, Response{"OK", 0, "CD_SUCCESS", {}});
+                        }
+
+                        if (req.cmd == "MKDIR")
+                        {
+                            std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
+                            // skontrolujeme ci je validny dir (automaticky posle ERRORS) root cesta ci sedi
+                            std::optional<std::filesystem::path> remote_path_r =
+                                check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),"new",socket);
+                            if (!remote_path_r.has_value()) {continue;}
+                            remote_path = remote_path_r.value();
+                            std::error_code ec;
+                            // pokusime sa vytvorit aj rekursivne dir
+                            std::filesystem::create_directories(remote_path,ec);
+                            if(ec)
+                            {
+                                send_response(socket, Response{"ERROR", 0, "MKDIR_FAILED", {"message", ec.message()}});
+                                continue;
+                            }
+                            send_response(socket, Response{"OK", 0, "MKDIR_SUCCESS", {}});
                             continue;
                         }
-                        send_response(socket, Response{"OK", 0, "DELETE_SUCCESS", {}}); 
-                        continue;
+
+                        if (req.cmd == "RMDIR")
+                        {
+                            std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
+                            // skontrolujeme ci je validny dir (automaticky posle ERRORS)
+                            std::optional<std::filesystem::path> remote_path_r =
+                                check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),"dir",socket);
+                            if (!remote_path_r.has_value()) {continue;}
+                            remote_path = remote_path_r.value();
+
+                            if(remote_path == user_profile.user_directory || remote_path == user_profile.working_directory)
+                            {
+                                send_response(socket, Response{"ERROR", 0, "RMDIR_FAILED", {"message", "Cannot remove user root directory."}});
+                                continue;
+                            }
+                            try
+                            {
+                                // odstranime dir
+                                delete_server_file(socket,remote_path.string(),false);
+                            }
+                            catch (std::exception& e)
+                            {
+                                send_response(socket, Response{"ERROR", 0, "RMDIR_FAILED", {"message", e.what()}});
+                                continue;
+                            }
+                            send_response(socket, Response{"OK", 0, "RMDIR_SUCCESS", {}});
+                            continue;
+                        }
+
+                        if (req.cmd == "MOVE" || req.cmd == "COPY")
+                        {
+                            std::filesystem::path source_path = std::filesystem::path(req.args["src"].get<std::string>());
+                            std::filesystem::path dest_path = std::filesystem::path(req.args["dst"].get<std::string>());
+
+                            std::string format_src;
+                            std::string format_dst;
+
+                            // potrebujeme vediet ci je file alebi dir pre kontrolu
+                            if (source_path.has_extension())
+                            {
+                                format_src = "file";
+                            }
+                            else
+                            {
+                                format_src = "dir";
+                            }
+
+
+                            if (dest_path.has_extension())
+                            {
+                                format_dst = "file";
+                            }
+                            else
+                            {
+                                format_dst = "dir";
+                            }
+
+                            // skontrolujeme ci je validny source path (automaticky posle ERRORS)
+                            std::optional<std::filesystem::path> source_path_r = 
+                                check_path(user_profile.user_directory,user_profile.working_directory,source_path.string(),format_src,socket);
+                            if (!source_path_r.has_value()) {continue;}
+                            source_path = source_path_r.value();
+                            // skontrolujeme ci je validny dest path (automaticky posle ERRORS)
+                            std::optional<std::filesystem::path> dest_path_r = 
+                                check_path(user_profile.user_directory,user_profile.working_directory,dest_path.string(),format_dst,socket);
+                            if (!dest_path_r.has_value()) {continue;}
+                            dest_path = dest_path_r.value();
+
+                            try
+                            {
+
+                                if(req.cmd == "MOVE")
+                                {
+                                    // pridame priponu na dest priecinok ak treba
+                                    std::filesystem::path final_dst = dest_path;
+                                    if (std::filesystem::is_directory(final_dst))
+                                    {
+                                        final_dst /= source_path.filename();
+                                    }
+                                    std::filesystem::rename(source_path, final_dst);
+                                }
+                                else // COPY
+                                {
+                                    if(!copy_server_file(source_path, dest_path))
+                                    {
+                                        send_response(socket, Response{"ERROR", 0, "COPY_FAILED", {"message", "Destination path is in wrong format."}});
+                                        continue;
+                                    }
+                                }
+                            }
+                            catch (std::exception& e)
+                            {
+                                // ak nastane chyba pri move alebo copy hned hlasime a koncime
+                                send_response(socket, Response{"ERROR", 0, req.cmd + "_FAILED", {"message", e.what()}});
+                                continue;
+                            }
+                            // success
+                            send_response(socket, Response{"OK", 0, req.cmd + "_SUCCESS", {}});
+                            continue;
+                        }
+
+                    // Vynimky pri spracovani cmds
                     }
-                
-                    if (req.cmd == "EXIT")
+                    catch(std::exception& e)
                     {
-                        //opdoved na EXIT a vypnutie
-                        send_response(socket, Response{"OK", 0, "GOODBYE", {}});
-                        std::cout << "[server] Client disconnected.\n";
-                        // zakazmeme dalsie zapisy a citania
-                        socket.shutdown(asio::ip::tcp::socket::shutdown_both);
+                        std::cerr << "[server] Exception: " << e.what() << "\n";
+                        std::cerr << "Emergency shutdown.\n";
                         break;
-                    }
-                
-                    if (req.cmd == "CD")
-                    {
-                        std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
-                        // skontrolujeme ci je validny dir (automaticky posle ERRORS)
-                        std::optional<std::filesystem::path> remote_path_r = 
-                            check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),"dir",socket);
-                        if (!remote_path_r.has_value()) {continue;}
-                        remote_path = remote_path_r.value();
-                        // nastavime novy work dir
-                        user_profile.working_directory = remote_path.string();
-                        send_response(socket, Response{"OK", 0, "CD_SUCCESS", {}});
-                    }
-
-                    if (req.cmd == "MKDIR")
-                    {
-                        std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
-                        // skontrolujeme ci je validny dir (automaticky posle ERRORS) root cesta ci sedi
-                        std::optional<std::filesystem::path> remote_path_r =
-                            check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),"new",socket);
-                        if (!remote_path_r.has_value()) {continue;}
-                        remote_path = remote_path_r.value();
-                        std::error_code ec;
-                        // pokusime sa vytvorit aj rekursivne dir
-                        std::filesystem::create_directories(remote_path,ec);
-                        if(ec)
-                        {
-                            send_response(socket, Response{"ERROR", 0, "MKDIR_FAILED", {"message", ec.message()}});
-                            continue;
-                        }
-                        send_response(socket, Response{"OK", 0, "MKDIR_SUCCESS", {}});
-                        continue;
-                    }
-
-                    if (req.cmd == "RMDIR")
-                    {
-                        std::filesystem::path remote_path = std::filesystem::path(req.args["path"].get<std::string>());
-                        // skontrolujeme ci je validny dir (automaticky posle ERRORS)
-                        std::optional<std::filesystem::path> remote_path_r =
-                            check_path(user_profile.user_directory,user_profile.working_directory,remote_path.string(),"dir",socket);
-                        if (!remote_path_r.has_value()) {continue;}
-                        remote_path = remote_path_r.value();
-
-                        if(remote_path == user_profile.user_directory || remote_path == user_profile.working_directory)
-                        {
-                            send_response(socket, Response{"ERROR", 0, "RMDIR_FAILED", {"message", "Cannot remove user root directory."}});
-                            continue;
-                        }
-                        try
-                        {
-                            // odstranime dir
-                            delete_server_file(socket,remote_path.string(),false);
-                        }
-                        catch (std::exception& e)
-                        {
-                            send_response(socket, Response{"ERROR", 0, "RMDIR_FAILED", {"message", e.what()}});
-                            continue;
-                        }
-                        send_response(socket, Response{"OK", 0, "RMDIR_SUCCESS", {}});
-                        continue;
-                    }
-
-                    if (req.cmd == "MOVE" || req.cmd == "COPY")
-                    {
-                        std::filesystem::path source_path = std::filesystem::path(req.args["src"].get<std::string>());
-                        std::filesystem::path dest_path = std::filesystem::path(req.args["dst"].get<std::string>());
-
-                        std::string format_src;
-                        std::string format_dst;
-
-                        // potrebujeme vediet ci je file alebi dir pre kontrolu
-                        if (source_path.has_extension())
-                        {
-                            format_src = "file";
-                        }
-                        else
-                        {
-                            format_src = "dir";
-                        }
-
-
-                        if (dest_path.has_extension())
-                        {
-                            format_dst = "file";
-                        }
-                        else
-                        {
-                            format_dst = "dir";
-                        }
-
-                        // skontrolujeme ci je validny source path (automaticky posle ERRORS)
-                        std::optional<std::filesystem::path> source_path_r = 
-                            check_path(user_profile.user_directory,user_profile.working_directory,source_path.string(),format_src,socket);
-                        if (!source_path_r.has_value()) {continue;}
-                        source_path = source_path_r.value();
-                        // skontrolujeme ci je validny dest path (automaticky posle ERRORS)
-                        std::optional<std::filesystem::path> dest_path_r = 
-                            check_path(user_profile.user_directory,user_profile.working_directory,dest_path.string(),format_dst,socket);
-                        if (!dest_path_r.has_value()) {continue;}
-                        dest_path = dest_path_r.value();
-
-                        try
-                        {
-
-                            if(req.cmd == "MOVE")
-                            {
-                                // pridame priponu na dest priecinok ak treba
-                                std::filesystem::path final_dst = dest_path;
-                                if (std::filesystem::is_directory(final_dst))
-                                {
-                                    final_dst /= source_path.filename();
-                                }
-                                std::filesystem::rename(source_path, final_dst);
-                            }
-                            else // COPY
-                            {
-                                if(!copy_server_file(source_path, dest_path))
-                                {
-                                    send_response(socket, Response{"ERROR", 0, "COPY_FAILED", {"message", "Destination path is in wrong format."}});
-                                    continue;
-                                }
-                            }
-                        }
-                        catch (std::exception& e)
-                        {
-                            // ak nastane chyba pri move alebo copy hned hlasime a koncime
-                            send_response(socket, Response{"ERROR", 0, req.cmd + "_FAILED", {"message", e.what()}});
-                            continue;
-                        }
-                        // success
-                        send_response(socket, Response{"OK", 0, req.cmd + "_SUCCESS", {}});
-                        continue;
-                    }
-
-                // Vynimky pri spracovani cmds
+                    }   
                 }
-                catch(std::exception& e)
-                {
-                    std::cerr << "[server] Exception: " << e.what() << "\n";
-                    std::cerr << "Emergency shutdown.\n";
-                    break;
-                }   
-            }
 
-            
-            // vypneme socket
-            socket.close();
+                
+                // vypneme socket
+                socket.close();
+            }
         }
         // Vynimky pri core praci so soketmi
         catch (std::exception& e) 
         {
             std::cerr << "[error] " << e.what() << "\n";
-            // socket.close();
-            // return 1;
+
         }
     }
     // zachytavame chyby pri inicilizacii
