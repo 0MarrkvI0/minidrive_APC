@@ -105,8 +105,6 @@ std::optional<std::filesystem::path> check_path
     asio::ip::tcp::socket& socket
 )
 {
-    std::cout << "[debug] check_path root_dir: " << root_dir << " work_dir: " << work_dir << " input_path: " << input_path << " type: " << type << "\n";
-
 
     std::filesystem::path root;
     try {
@@ -146,8 +144,6 @@ std::optional<std::filesystem::path> check_path
         send_response(socket, {"ERROR", 400, "INVALID_PATH", {}});
         return std::nullopt;
     }
-
-    std::cout << requested << " -> " << resolved << "\n";
 
     // ochrana proti escape mimo root
     if (!is_subpath(root, resolved))
@@ -730,7 +726,7 @@ int main(int argc, char* argv[])
                                         successful_uploads++;
                                     }
                                 }
-                                std::cout <<"sc:" << successful_uploads << "/n";
+                  
                                 const auto failed_uploads = compared["counts"]["upload"].get<std::uint64_t>() - successful_uploads;
 
                                 // ak sme mali neuspesne uploady budu skip

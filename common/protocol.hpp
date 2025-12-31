@@ -554,7 +554,6 @@ inline nlohmann::json compare_repos
 
         if (s_file == server.end())
         {
-        std::cout << c_file_info.abs_path << " nie je na serveri\n";
 
         // vypocitame relativnu cestu servera aby sme zachovali strukturu priecinkov
         std::filesystem::path remote_abs = (f_server_root / std::filesystem::path(c_path)).lexically_normal().parent_path();
@@ -572,13 +571,13 @@ inline nlohmann::json compare_repos
         // porovname hash a size oboch suborov
         if (!c_file_info.hash.empty() && !s_info.hash.empty() && c_file_info.hash == s_info.hash)
         {
-            std::cout << c_file_info.abs_path << " skip /n";
+ 
             // ak sa zhoduju mozeme skip
             out["skip"].push_back({{"local_path", c_file_info.abs_path}});
         }
         else
         {
-            std::cout << c_file_info.abs_path << " zmenene " << s_info.abs_path << " nie je na serveri /n";
+
             // ak zmenene tak si ulozime paths pre UPLOAD
             out["upload"].push_back({
                 {"local_path", c_file_info.abs_path},
@@ -593,7 +592,6 @@ inline nlohmann::json compare_repos
         if (client.find(s_path) == client.end())
         {
 
-            std::cout << s_file_info.abs_path << " delete na serveri /n";
             out["delete"].push_back({
                 {"remote_path", s_file_info.abs_path}
             });

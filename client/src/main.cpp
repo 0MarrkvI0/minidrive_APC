@@ -13,28 +13,6 @@
 
 using asio::ip::tcp;
 
-// const std::string TRANSFERS_PATH = "client/transfers";
-
-//TODO multithread
-
-// int main(int argc, char** argv) {
-//     config base = set_up_config(argc, argv, config{});
-
-//     int N = 5; // koľko klientov chceš
-//     std::vector<std::thread> threads;
-//     threads.reserve(N);
-
-//     for (int i = 0; i < N; i++) {
-//         config cfg = base;
-//         cfg.username = base.username + std::to_string(i);    
-//         cfg.log_file = "client_" + std::to_string(i) + ".log"; 
-
-//         threads.emplace_back([cfg, i] { run_client_instance(cfg, i); });
-//     }
-
-//     for (auto& t : threads) t.join();
-// }
-
 struct config {
     std::string username;
     std::string server_ip;

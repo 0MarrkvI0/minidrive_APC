@@ -9,7 +9,6 @@
 
 using json = nlohmann::json;
 
-inline constexpr const char* METAFILE_FILEPATH = "/.meta"; // (alebo len ".meta")
 
 struct FileTransferMeta
 {
