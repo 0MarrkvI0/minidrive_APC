@@ -172,6 +172,7 @@ inline void send_message
             throw std::runtime_error("seekg failed: " + path.string());
         }    
         std::array<char, CHUNK> buf;
+        std::uint64_t sent = 0;
 
         while (remaining > 0)
         {
@@ -186,12 +187,19 @@ inline void send_message
                 throw std::runtime_error("File read failed/EOF before expected: " + path.string());
             }
             asio::write(s, asio::buffer(buf.data(), have));
+
+            sent += have;
             remaining -= have;
+
+            std::cout << "[send] chunk=" << have
+              << " sent=" << sent
+              << " remaining=" << remaining << "\n";
         }
     }
     else
     {
         std::uint64_t pos = offset;
+        std::uint64_t sent = 0;
 
         while (remaining > 0)
         {
@@ -200,6 +208,11 @@ inline void send_message
             asio::write(s, asio::buffer(message.data() + pos, want));
             pos += want;
             remaining -= want;
+            sent += want;
+
+            std::cout << "[send] chunk=" << want
+              << " sent=" << sent
+              << " remaining=" << remaining << "\n";
         }
     }
 }
@@ -295,13 +308,13 @@ inline std::optional<std::string> receive_message
             p = meta.remote_path;  
             meta.offset = 0;
         }
-     
+
         std::filesystem::path out_path(meta.remote_path);
         // otvor / vytvor cieľový súbor
         std::fstream out(out_path, std::ios::in | std::ios::out | std::ios::binary);
         if (!out)
         {
-            std::ofstream create(out_path, std::ios::binary | std::ios::app);
+            std::ofstream create(out_path, std::ios::binary);
             if (!create)
             {
                 throw std::runtime_error("Failed to create file.");
@@ -338,6 +351,8 @@ inline std::optional<std::string> receive_message
         meta_path = tr_p.string();
 
 
+        std::uint64_t total = remaining;
+        std::uint64_t received = 0;
         while (remaining > 0)
         {
             std::size_t want = std::min<std::uint64_t>(remaining, buf.size());
@@ -355,6 +370,10 @@ inline std::optional<std::string> receive_message
             }
 
             remaining -= got;
+            received += got;
+
+            int percent = static_cast<int>((received * 100) / total);
+            std::cout << "\r[download] " << percent << "%" << std::flush;
 
             if (!is_public)
             {
@@ -373,7 +392,9 @@ inline std::optional<std::string> receive_message
                     bytes_since_meta_write = 0;
                 }
             }
+            
         }
+        std::cout << "\n";
 
         // po dokonceni sa zmaze meta 
         if (!is_public && meta.offset == meta.file_size)
@@ -505,7 +526,9 @@ inline std::unordered_map<std::string, repo_item>repo_items_to_map(const nlohman
 inline nlohmann::json compare_repos
 (
     const nlohmann::json& server_repo,
-    const nlohmann::json& client_repo
+    const nlohmann::json& client_repo,
+    const std::string& server_root,
+    const std::string& client_root
 )
 {
     // pre rychle hladanie
@@ -517,9 +540,14 @@ inline nlohmann::json compare_repos
     out["skip"] = nlohmann::json::array();
     out["delete"] = nlohmann::json::array();
 
+
+    const std::filesystem::path f_client_root = std::filesystem::path(client_root);
+    const std::filesystem::path f_server_root = std::filesystem::path(server_root);
+
     // klientove subory hladame na serveri
     // kluc: rel_path 
     // hodnota : ostatne z repo_item (size,hash,abs_path)
+
     for (const auto& [c_path, c_file_info] : client)
     {
         auto s_file = server.find(c_path);
@@ -528,9 +556,12 @@ inline nlohmann::json compare_repos
         {
         std::cout << c_file_info.abs_path << " nie je na serveri\n";
 
+        // vypocitame relativnu cestu servera aby sme zachovali strukturu priecinkov
+        std::filesystem::path remote_abs = (f_server_root / std::filesystem::path(c_path)).lexically_normal().parent_path();
             // nie je na serveri (UPLOAD)
             out["upload"].push_back({
-                {"local_path", c_file_info.abs_path}
+                {"local_path", c_file_info.abs_path},
+                {"remote_path",remote_abs.string()}
             });
             continue;
         }

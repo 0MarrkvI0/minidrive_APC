@@ -35,36 +35,6 @@ using asio::ip::tcp;
 //     for (auto& t : threads) t.join();
 // }
 
-
-#include <spdlog/spdlog.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/sinks/basic_file_sink.h>
-
-//TODO: logovanie do suboru aj na konzolu
-void init_logging(const std::string& log_file)
-{
-    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-    auto file_sink    = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
-                            log_file, true); // append
-
-    console_sink->set_level(spdlog::level::info);   // CMD
-    file_sink->set_level(spdlog::level::debug);    // FILE
-
-    std::vector<spdlog::sink_ptr> sinks { console_sink, file_sink };
-
-    auto logger = std::make_shared<spdlog::logger>(
-        "client_logger",
-        sinks.begin(),
-        sinks.end()
-    );
-
-    spdlog::set_default_logger(logger);
-    spdlog::set_level(spdlog::level::debug);
-    spdlog::flush_on(spdlog::level::info);
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-}
-
-
 struct config {
     std::string username;
     std::string server_ip;
@@ -97,6 +67,53 @@ const std::unordered_map<std::string, cmd_spec> CMD_LIST =
     {"EXIT",{{},0,0}}
 };
 
+
+// pomocna funkcia na vypis CMD LISTU
+void print_help(const std::unordered_map<std::string, cmd_spec>& cmds)
+{
+    constexpr int CMD_W  = 12;
+    constexpr int ARGS_W = 32;
+    constexpr int CNT_W  = 8;
+
+    std::cout
+        << std::left
+        << std::setw(CMD_W)  << "COMMAND"
+        << std::setw(ARGS_W) << "ARGS"
+        << std::setw(CNT_W)  << "COUNT\n"
+        << std::string(CMD_W + ARGS_W + CNT_W, '-') << "\n";
+
+    for (const auto& [name, spec] : cmds)
+    {
+        std::ostringstream args;
+
+        for (std::size_t i = 0; i < spec.args.size(); ++i)
+        {
+            bool required = i < spec.min_args;
+
+            if (required)
+                args << "<" << spec.args[i] << ">";
+            else
+                args << " [" << spec.args[i] << "]";
+
+            if (i + 1 < spec.args.size())
+                args << " ";
+        }
+
+        std::string count;
+        if (spec.min_args == spec.max_args)
+            count = std::to_string(spec.min_args);
+        else
+            count = std::to_string(spec.min_args) + "-" +
+                    std::to_string(spec.max_args);
+
+        std::cout
+            << std::left
+            << std::setw(CMD_W)  << name
+            << std::setw(ARGS_W) << args.str()
+            << std::setw(CNT_W)  << count
+            << "\n";
+    }
+}
 
 bool send_request(asio::ip::tcp::socket& socket, const Request& req)
 {
@@ -353,7 +370,11 @@ void handle_upload(asio::ip::tcp::socket& socket, Request& req)
                 ); 
             }
             // koniec success upload
-            if (resp.code == 0) {return;}
+            if (resp.code == 0) 
+            {
+                spdlog::info("Upload completed: {}", local_path.string());
+                return;
+            }
 
         }
         // ak subor uz je vytvoreny
@@ -395,15 +416,22 @@ void handle_download(asio::ip::tcp::socket& socket, Request& req, const bool is_
     }
     else
     {
-        local_path = std::filesystem::path(req.args["local_path"].get<std::string>()) / filename;
+        local_path = std::filesystem::path(req.args["local_path"].get<std::string>());
+        if (!std::filesystem::exists(local_path))
+        {
+            //ak part subor neexistuje, musime znova stiahnut od zaciatku
+            req.args["offset"] = 0;
+        }
     }
 
     std::error_code ec;
 
-    if (std::filesystem::exists(local_path, ec))
+    if (std::filesystem::exists(local_path, ec) && !req.args.contains("resume"))
     {
-
+        // ak existuje uz rovnaky file
+        // ak neda nic tak sa zrusi cely cmd
         if (handle_duplicate(socket,req)){return;}
+        // vymazeme subor ak si user zela
         if (req.args.contains("force"))
         {
             std::filesystem::remove(local_path,ec);
@@ -411,6 +439,7 @@ void handle_download(asio::ip::tcp::socket& socket, Request& req, const bool is_
         }
         else
         {
+            // upadte path ak si user zela
             local_path = std::filesystem::path(req.args["local_path"].get<std::string>()) / filename;
         }     
     }
@@ -454,8 +483,12 @@ void handle_download(asio::ip::tcp::socket& socket, Request& req, const bool is_
                 );
 
             }
-            // koniec success upload
-            if (resp.code == 0) {return;}
+            // koniec success 
+            if (resp.code == 0) 
+            {
+                spdlog::info("Download completed: {}", local_path.string());
+                return;
+            }
 
         }
         else
@@ -534,6 +567,7 @@ void handle_sync(asio::ip::tcp::socket& socket, Request& req)
         if (resp.message == "SYNC_END")
         {
             std::cout << resp.data.at(1).dump(2) << "\n";
+            spdlog::info("SYNC completed: {}", resp.data.at(1).dump());
             return; 
         }
         else
@@ -560,9 +594,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    try {
+    
         asio::io_context io_context;
         config client_config;
+
         // client configuration
         client_config = set_up_config(argc, argv, client_config);
 
@@ -583,10 +618,19 @@ int main(int argc, char* argv[]) {
         }
 
         tcp::resolver resolver(io_context);
-        auto endpoints = resolver.resolve(client_config.server_ip, client_config.port);
+        asio::error_code ec;
+        auto endpoints = resolver.resolve(client_config.server_ip, client_config.port,ec);
+
+        if (ec) 
+        {
+            std::cerr << "Resolve failed: " << ec.message() << "\n";
+            return 1;
+        }
 
         // bind and connect socket
         tcp::socket socket(io_context);
+
+    try {
         // https://think-async.com/Asio/asio-1.36.0/doc/asio/reference/connect/overload8.html
         asio::connect(socket, endpoints);
 
@@ -611,7 +655,7 @@ int main(int argc, char* argv[]) {
         {
             resp = receive_response(socket);
 
-            //TODO: handle different error codes
+
             if (resp.status == "ERROR") 
             {
                 bool ask_for_password = false;
@@ -619,6 +663,7 @@ int main(int argc, char* argv[]) {
                 {
                 case 400:
                     std::cerr << "[error] Missing fields in request. Please provide correct username:";
+                    spdlog::error("Missing fields in AUTH request");
                     read_line_trim(client_config.username);
                     req.args["username"] = client_config.username;
                     req.cmd = "AUTH";
@@ -626,6 +671,7 @@ int main(int argc, char* argv[]) {
 
                 case 401:
                     std::cerr << "[error] No password hash found for user. Please register first.\nEnter username:\n";
+                    spdlog::error("No password hash found for user {}", client_config.username);
                     read_line_trim(client_config.username);
                     req.args["username"] = client_config.username;
                     req.cmd = "REGS";
@@ -634,6 +680,7 @@ int main(int argc, char* argv[]) {
 
                 case 1001:
                     std::cerr << "[error] User not found. Please register first.\nEnter username:";
+                    spdlog::error("User not found {}", client_config.username);
                     read_line_trim(client_config.username);
                     req.args["username"] = client_config.username;
                     req.cmd = "REGS";
@@ -642,6 +689,7 @@ int main(int argc, char* argv[]) {
 
                 case 1002:
                     std::cerr << "[error] Username already taken. Please choose another username:";
+                    spdlog::error("Username already taken: {}", client_config.username);
                     read_line_trim(client_config.username);
                     req.args["username"] = client_config.username;
                     req.cmd = "REGS";
@@ -650,6 +698,7 @@ int main(int argc, char* argv[]) {
                 
                 case 1003:
                     std::cerr << "[error] Invalid password. Please try again.\n";
+                    spdlog::error("Invalid password for user: {}", client_config.username);
                     req.cmd = "LOGN";
                     req.args["username"] = client_config.username;
                     ask_for_password = true;
@@ -657,13 +706,14 @@ int main(int argc, char* argv[]) {
 
                 default:
                     std::cerr << "[error] Unknown error.\n";
+                    spdlog::error("Unknown error during authentication: {} {}", resp.code, resp.message);
                     return 1;
                 
                 }
                 if (ask_for_password)
                 {
                     std::string password;
-                    std::cout << "Enter your password:" << client_config.username << ": ";
+                    std::cout << "Enter your password " << client_config.username << ": ";
                     read_line_trim(password);
                     req.args["password"] = password;
                 }
@@ -796,7 +846,7 @@ int main(int argc, char* argv[]) {
                     req.cmd = "LOGN";
                     req.args["username"] = client_config.username;
                     std::string password;
-                    std::cout << "Enter your password:" << client_config.username << "': ";
+                    std::cout << "Enter your password " << client_config.username << ": ";
                     std::getline(std::cin, password);
                     req.args["password"] = password;
                     std::cout << "Loggining user...\n";
@@ -834,14 +884,90 @@ int main(int argc, char* argv[]) {
                     handle_upload(socket,req);
                     continue;
                 }
+
                 if (req.cmd == "DOWNLOAD")
                 {
                     handle_download(socket,req,client_config.username == "public");
                     continue;
                 }
+                
                 if (req.cmd == "SYNC")
                 {
                     handle_sync(socket,req);
+                    continue;
+                }
+
+                if (req.cmd == "DELETE")
+                {
+                    send_request(socket,req);
+                    resp = receive_response(socket);
+                    spdlog::info("DELETE path:{} response: {} {} {}", req.args["path"].get<std::string>(), resp.status, resp.code, resp.message);
+                    continue;
+                }
+
+                if (req.cmd == "LIST")
+                {
+                    send_request(socket, req);
+
+                    while (true)
+                    {
+                        resp = receive_response(socket);
+
+                        if (resp.status != "OK") break;
+
+                        if (resp.code == 1) // START_LIST
+                        {
+                            FileTransferMeta meta;
+                            meta.file_size = resp.data["size"].get<uint64_t>();
+
+                            if (meta.file_size == 0)
+                            {
+                                std::cout << "directory is empty\n";
+                                continue;
+                            }
+
+                            auto msg = receive_message(socket, meta, " ", false, false);
+                            if (msg) std::cout << *msg << "\n";
+                        }
+                        else
+                        {
+                            break; // END_LIST
+                        }
+                    }
+                    continue;
+                }
+
+            
+                if (req.cmd == "EXIT")
+                {
+                    // posleme na server EXIT req
+                    send_request(socket,req);
+                    //cakame na odopoved
+                    resp = receive_response(socket);
+                    // ak je ok tak uzarieme spojenie
+                    if (resp.status == "OK" && resp.code == 0)
+                    {
+                        std::cout << "Goodbye!\n";
+                        spdlog::info("Client exited {}", client_config.username);
+                        // zakazmeme dalsie zapisy a citania
+                        socket.shutdown(asio::ip::tcp::socket::shutdown_both);
+                        break;
+                    }
+                    continue;                   
+                }   
+            
+                if (req.cmd == "HELP")
+                {
+                    //vypise zoznam cmd s parametrami a min-max argumentami
+                    print_help(CMD_LIST);
+                    continue;
+                }
+              
+                if (req.cmd == "CD" || req.cmd == "MKDIR" || req.cmd == "RMDIR" || req.cmd == "MOVE" || req.cmd == "COPY")
+                {
+                    send_request(socket,req);
+                    resp = receive_response(socket);
+                    spdlog::info("{} args:{} response: {} {} {}", req.cmd, req.args.dump(), resp.status, resp.code, resp.message);
                     continue;
                 }
             }
@@ -849,96 +975,22 @@ int main(int argc, char* argv[]) {
             {
                 std::cerr << "[error] " << e.what() << "\n";
                 spdlog::error("{}", e.what());
-                continue;
+                // continue;
+                std::cerr << "Emergency shutdown.\n";
+                break;
             }
-            
-
-            // if (req.cmd == "UPLOAD")
-            // {
-            //     std::filesystem::path local_path = req.args["local_path"].get<std::string>();
-            //     req.args["offset"] = 0;
-            //     // req.args["offset"] = 3;
-            //     req.args["size"] = std::filesystem::file_size(local_path);
-            //     req.args["hash"] = "sha256_" + sha256_file(local_path);
-            // }
-
-            // if (req.cmd == "DOWNLOAD")
-            // {
-
-            // }
-             
-
-            // if (!send_request(socket, req)) 
-            // {
-            //     std::cerr << "[error] Failed to send request\n";
-            //     spdlog::error("Failed to send request");
-            //     continue;
-            // }
-
-            // while (true)
-            // { 
-            //     resp = receive_response(socket);
-            //     if(resp.status == "OK" && resp.code == 1)
-            //     {
-            //         // std::uint64_t size = resp.data.at("size").get<std::uint64_t>();
-            //         // if (req.cmd == "LIST")
-            //         // {
-            //         //     auto msg = receive_message(socket, "", size, false);
-            //         //     if (msg) {
-            //         //         std::cout << *msg << "\n";
-            //         //     } else {
-            //         //         std::cout << "[client] no message\n";
-            //         //     }
-            //         //     continue; 
-            //         // }
-            //         if (req.cmd == "UPLOAD")
-            //         {
-            //             std::cout << "somtu?" << std::endl;
-            //             send_message
-            //             (
-            //                 socket,
-            //                 req.args["local_path"].get<std::string>(),
-            //                 req.args["size"].get<std::uint64_t>(),
-            //                 req.args["offset"].get<std::uint64_t>(),
-            //                 true
-            //             );
-
-            //         }
-            //     }
-            //     else
-            //     {
-            //         break;
-            //     }
-            // }
-            
-          
-            // asio::write(socket, asio::buffer(message));
-
-
-            // std::size_t sent = 0;
-            // while (sent < len) {
-            //     auto n = ::send(fd, buf + sent, len - sent, 0);
-            //     if (n <= 0) { /* error/closed */ }
-            //     sent += static_cast<std::size_t>(n);
-            // }
-
-
-         
-            // do {
-            //     Response resp = receive_response(socket);
-            //     std::cout << "[server] Response: " << resp.status
-            //             << " (" << resp.code << "): " << resp.message << "\n";
-            // } while (socket.available() > 0);
-
-            // Receive echo
-            // char reply[1024];
-            // size_t reply_length = socket.read_some(asio::buffer(reply));
-            // std::cout << "Echo: " << std::string(reply, reply_length) << std::endl;
         }
+
+        
+        // vypneme socket
+        socket.close();
     }
-    catch (std::exception& e) {
+    catch (std::exception& e) 
+    {
         std::cerr << "[error] " << e.what() << "\n";
         spdlog::error("{}", e.what());
+        socket.close();
+        return 1;
     }
 
     return 0;

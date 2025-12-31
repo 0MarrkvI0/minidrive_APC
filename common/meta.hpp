@@ -133,11 +133,16 @@ inline nlohmann::json load_transfer_meta(const std::string& transfer_dir)
             in >> j;
 
             FileTransferMeta meta = j.get<FileTransferMeta>();
+            if (!std::filesystem::exists(meta.remote_path))
+            {
+                // súbor už neexistuje, zacneme od zaciatku
+                meta.offset = 0;
+            }
             result.push_back(meta); // použije to_json
         }
         catch (...)
         {
-            // poškodený / nečitateľný meta súbor → ignoruj
+            // poškodený / nečitateľný meta súbor
             continue;
         }
     }
